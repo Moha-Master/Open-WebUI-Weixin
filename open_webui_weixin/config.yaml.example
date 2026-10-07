@@ -1,0 +1,56 @@
+# Open WebUI <-> 微信 iLink 适配器配置
+
+owui:
+  # 正在运行的 Open WebUI 后端地址
+  base_url: "http://127.0.0.1:8901"
+
+weixin:
+  # iLink Bot API 基址（腾讯官方 openclaw-weixin 所用）
+  base_url: "https://ilinkai.weixin.qq.com"
+  cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c"
+  bot_type: "3"
+  # 伪装成官方插件的版本标识，服务端会记录；变更可能影响兼容性
+  channel_version: "2.4.9"
+  bot_agent: "owux/0.1.0"
+  # 长轮询 hold 时长（毫秒），服务端返回 longpolling_timeout_ms 时以其为准
+  long_poll_timeout_ms: 35000
+  api_timeout_ms: 15000
+
+state:
+  # SQLite 数据库路径，相对路径以本文件所在目录为基准
+  path: "data/state.db"
+
+logging:
+  level: "INFO"
+  # 设为 true 时额外写入 state 同目录下的 adapter.log
+  to_file: true
+
+reply:
+  # 单条微信文本消息的最大字符数，超出按标点回退切分
+  max_length: 1024
+  # 分片之间的发送间隔（秒），避免过快
+  segment_interval: 0.4
+
+# 事件呈现策略（刻意不做成运行时命令，避免命令表膨胀）
+display:
+  reasoning: false           # 是否推送模型思考内容
+  tool_status: true          # 是否推送检索/工具进度
+  progress_as_message: false # 进度是否单独占一条微信消息
+  citations: true            # 回复末尾附引用来源
+  typing: true               # 生成期间显示微信原生「正在输入」
+
+# 每次生成携带的能力。OWUI 后端不会把模型自带的默认功能翻译成请求字段，
+# 必须由调用方自己翻译（详见 open_webui_weixin/capabilities.py 的说明）。
+capabilities:
+  # true = 由"模型 meta 的默认功能 + 管理员总闸"决定，与网页端行为一致
+  follow_model_defaults: true
+  # 唯一只属于适配器自己的开关：挂终端等于允许模型在那台服务器上执行命令
+  allow_terminal: true
+  # 以下各项是**允许上限**：跟随模式下依然先由模型默认决定，这里设为 false 可一票否决；
+  # 只有 follow_model_defaults: false 时才反过来由它们直接决定
+  tools: true                # 带上该用户全部可用工具（MCP 服务器 + workspace 工具）
+  web_search: true           # 联网搜索
+  image_generation: true     # 图像生成（注意：生成的图片目前投递不到微信）
+  code_interpreter: true     # 代码解释器（pyodide 引擎需浏览器执行，实际永远被我们关掉）
+  memory: true               # 长期记忆（会在服务端读写记忆）
+  # 有意不开放：voice —— 它让服务端产出语音回复，微信文本侧无落点

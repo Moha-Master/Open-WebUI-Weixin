@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-webui-weixin"
+version = "0.1.0"
+description = "Open WebUI <-> 微信 iLink 适配器"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Moha-Master", email = "hongkongreporter@outlook.com" }]
+license = "MIT"
+dependencies = [
+    "httpx>=0.28",
+    "qrcode>=8.2",
+    "PyYAML>=6.0",
+    "python-socketio>=5.16",
+    # python-socketio 的 AsyncClient 走 websocket 传输必须有 aiohttp，
+    # 缺失时报错很隐蔽（只在连接阶段抛 "Unexpected connection error"）
+    "aiohttp>=3.11",
+]
+
+# 入口保持简短好敲；包名与工作目录用全称，便于在 pip / ~/.config 里一眼认出
+[project.scripts]
+owux = "open_webui_weixin.main:main"
+
+[project.optional-dependencies]
+dev = ["ruff>=0.6"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["open_webui_weixin*"]
+
+[tool.setuptools.package-data]
+open_webui_weixin = ["config.yaml.example"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+# 全局配置偏严（BLE001/PLR* 等），这里只保留对本项目有实际价值的规则
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = [
+    # 顶层循环需要兜底捕获，避免单条消息异常终止整个适配器
+    "BLE001",
+    # 本项目注释与用户文案使用中文标点，这三条是对全角符号的误报
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]
