@@ -57,12 +57,28 @@ class ReplyConfig:
 
 
 @dataclasses.dataclass
+class ReasoningDisplay:
+    """模型思考内容的呈现方式。"""
+
+    enable: bool = False  # 关 = 完全不外泄
+    detailed: bool = False  # 开 = 推送全文；关 = 每个思考块只提示一次「正在思考」
+
+
+@dataclasses.dataclass
+class ToolStatusDisplay:
+    """工具调用与检索进度的呈现方式。"""
+
+    enable: bool = True  # 关 = 正文之外一律不出声
+    detailed: bool = False  # 开 = 每个工具一条（名称 + 入参 + 返回，均截断）
+    # 关 = 每段正文开始前汇总一条「使用了 N 个工具：a、b×2」
+
+
+@dataclasses.dataclass
 class DisplayConfig:
     """事件呈现策略。按讨论结论，这些不做成运行时命令，改配置即可。"""
 
-    reasoning: bool = False  # 是否推送模型思考内容
-    tool_status: bool = True  # 是否推送检索/工具进度
-    progress_as_message: bool = False  # 进度是否单独占一条消息，否则只用于 typing 节奏
+    reasoning: ReasoningDisplay = dataclasses.field(default_factory=ReasoningDisplay)
+    tool_status: ToolStatusDisplay = dataclasses.field(default_factory=ToolStatusDisplay)
     citations: bool = True  # 回复末尾附引用来源
     typing: bool = True  # 生成期间显示微信原生「正在输入」
 
@@ -125,6 +141,17 @@ def _apply(obj: Any, data: dict[str, Any], name: str) -> None:
     for key, value in data.items():
         if key not in valid:
             log.warning("配置 %s 中存在未知字段 %r，已忽略", name, key)
+            continue
+        current = getattr(obj, key)
+        if dataclasses.is_dataclass(current):
+            # 段落值：旧配置里 reasoning/tool_status 是裸布尔（只表达开关），
+            # 迁移成映射时保留该开关，detailed 走默认值
+            if isinstance(value, bool):
+                current.enable = value
+            elif isinstance(value, dict):
+                _apply(current, value, f"{name}.{key}")
+            else:
+                log.warning("配置 %s.%s 需要映射，收到 %r，已忽略", name, key, value)
             continue
         setattr(obj, key, value)
 

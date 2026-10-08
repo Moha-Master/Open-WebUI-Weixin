@@ -58,7 +58,7 @@ class TurnResult:
         self.notice: str | None = None  # 已推给用户的提示（如自动选用模型）
         self.chat_id: str | None = None
         self.sent_segments = 0
-        self.progress_lines: list[str] = []
+        self.note_lines: list[str] = []  # 侧栏说明（思考提示/工具调用/检索状态）
 
 
 class ChatRunner:
@@ -121,8 +121,10 @@ class ChatRunner:
         assistant_msg_id = str(uuid.uuid4())
         renderer = TurnRenderer(
             max_length=self.cfg.reply.max_length,
-            show_reasoning=self.cfg.display.reasoning,
-            show_tool_status=self.cfg.display.tool_status,
+            show_reasoning=self.cfg.display.reasoning.enable,
+            reasoning_detailed=self.cfg.display.reasoning.detailed,
+            show_tool_status=self.cfg.display.tool_status.enable,
+            tool_status_detailed=self.cfg.display.tool_status.detailed,
         )
 
         try:
@@ -270,10 +272,8 @@ class ChatRunner:
             if payload.get("chat_id") and not result.chat_id:
                 result.chat_id = str(payload["chat_id"])
 
-            for line in evt.progress:
-                result.progress_lines.append(line)
-                if self.cfg.display.progress_as_message:
-                    await self._send_text(wechat_user_id, line)
+            if evt.notes:
+                await self._emit_notes(wechat_user_id, evt.notes, result)
 
             if evt.text_chunks:
                 await self._emit(wechat_user_id, evt.text_chunks, result)
@@ -298,5 +298,13 @@ class ChatRunner:
         for chunk in chunks:
             await self._send_text(wechat_user_id, chunk)
             result.sent_segments += 1
+            if self.cfg.reply.segment_interval > 0:
+                await asyncio.sleep(self.cfg.reply.segment_interval)
+
+    async def _emit_notes(self, wechat_user_id: str, notes: list[str], result: TurnResult) -> None:
+        """侧栏说明独立成条：它解释"刚才那段为什么这么久"，不能混进正文历史。"""
+        for note in notes:
+            result.note_lines.append(note)
+            await self._send_text(wechat_user_id, note)
             if self.cfg.reply.segment_interval > 0:
                 await asyncio.sleep(self.cfg.reply.segment_interval)

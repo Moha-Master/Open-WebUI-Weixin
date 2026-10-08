@@ -33,11 +33,17 @@ reply:
 
 # 事件呈现策略（刻意不做成运行时命令，避免命令表膨胀）
 display:
-  reasoning: false           # 是否推送模型思考内容
-  tool_status: true          # 是否推送检索/工具进度
-  progress_as_message: false # 进度是否单独占一条微信消息
-  citations: true            # 回复末尾附引用来源
-  typing: true               # 生成期间显示微信原生「正在输入」
+  # 模型思考内容
+  reasoning:
+    enable: false      # 关 = 思考一个字都不外泄
+    detailed: false    # 开 = 推送思考全文；关 = 每个思考块只发一条「💭 正在思考…」
+  # 工具调用与检索进度
+  tool_status:
+    enable: true       # 关 = 正文之外一律不出声
+    detailed: false    # 开 = 每个工具一条「调用了 X / 参数… / 返回…」（入参与返回都截断）
+                       # 关 = 每段正文开始前汇总一条「使用了 N 个工具：a、b×2」
+  citations: true      # 回复末尾附引用来源
+  typing: true         # 生成期间显示微信原生「正在输入」
 
 # 每次生成携带的能力。OWUI 后端不会把模型自带的默认功能翻译成请求字段，
 # 必须由调用方自己翻译（详见 open_webui_weixin/capabilities.py 的说明）。

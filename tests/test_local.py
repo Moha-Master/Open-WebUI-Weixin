@@ -301,6 +301,31 @@ async def main() -> None:
     check("URL 无尾斜杠", not cfg.owui.base_url.endswith("/") and not cfg.weixin.base_url.endswith("/"))
     expected_state = tmp.resolve() / "data" / "state.db"
     check("相对 state 路径以配置目录为基准", cfg.state_path == expected_state, cfg.state_path)
+    check("模板的思考档默认只开关不带全文",
+          cfg.display.reasoning.enable is False and cfg.display.reasoning.detailed is False)
+    check("模板的工具档默认开启且汇总",
+          cfg.display.tool_status.enable is True and cfg.display.tool_status.detailed is False)
+
+    legacy = tmp / "legacy" / "config.yaml"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(
+        "display:\n"
+        "  reasoning: true\n"
+        "  tool_status: false\n"
+        "  progress_as_message: true\n",
+        encoding="utf-8",
+    )
+    old = load_config(legacy)
+    check("旧扁平布尔仍能解析为开关",
+          old.display.reasoning.enable is True and old.display.tool_status.enable is False)
+    check("旧字段缺失时 detailed 取默认", old.display.reasoning.detailed is False)
+    check("已废弃的 progress_as_message 被忽略而不炸", not hasattr(old.display, "progress_as_message"))
+    nested = tmp / "nested" / "config.yaml"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    nested.write_text("display:\n  tool_status:\n    enable: true\n    detailed: true\n", encoding="utf-8")
+    deep = load_config(nested)
+    check("嵌套写法逐字段生效",
+          deep.display.tool_status.detailed is True and deep.display.reasoning.enable is False)
 
     print("\n[2] iLink 协议头与版本编码")
     check("2.4.9 -> 132105", _client_version_encoded("2.4.9") == str((2 << 16) | (4 << 8) | 9))

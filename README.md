@@ -178,6 +178,29 @@ socket 侧的配套应答：`request:terminal:state` 明确回 `{connected: fals
 
 生成回合里若能力探测失败，**直接报错不发送**，而不是少带工具继续生成 —— 后者会让模型答不出本该能答的内容，而用户无从察觉。
 
+### 事件呈现策略（display）
+
+一次生成除了正文还有思考、工具调用、检索状态等事件，微信侧怎么呈现由 `config.yaml` 的 `display` 决定（刻意不做成运行时命令，避免命令表膨胀）：
+
+```yaml
+display:
+  reasoning:
+    enable: false      # 关 = 思考一个字都不外泄
+    detailed: false    # 开 = 推送思考全文；关 = 每个思考块只发一条「💭 正在思考…」
+  tool_status:
+    enable: true       # 关 = 正文之外一律不出声
+    detailed: false    # 开 = 每个工具一条「调用了 X / 参数… / 返回…」（入参与返回都截断）
+                       # 关 = 每段正文开始前汇总一条「使用了 N 个工具：a、b×2」
+  citations: true      # 回复末尾附引用来源
+  typing: true         # 生成期间显示微信原生「正在输入」
+```
+
+两条轴各自独立，侧栏说明（`💭`/`🔧`/`↩`）与正文**分道发消息**：既保住时序（事件到达即发出），也不污染 `full_text`（临时聊天要存的历史正文只含模型答复）。旧配置的扁平写法（`reasoning: true`）自动当开关读，`progress_as_message` 已废弃——进度要么成条要么不出声，不再有"只喂 typing"的中间态。
+
+汇总模式的切分点按用户实际读法来：段正文开始前把**上一段正文之后**的所有工具调用一次性结算，所以"思考→连串工具→正文"的链式调用只会多出一条汇总，而穿插正文的调用则是每段一条。
+
+工具返回（`function_call_output`）在后端**不单独成事件**，只出现在回合终态的 `output` 快照里（`middleware.py:6156` 只 append 不 emit），所以详细模式的"返回"一行通常随终态一起到；渲染层因此也读 `chat:completion` 的中途快照，避免网页端那套 `continuing` 全量快照模式（客户端带 `assistant_message_id` 时）下漏掉工具。
+
 ## 测试
 
 ```bash

@@ -127,37 +127,116 @@ def test_max_length_split() -> None:
     check("切分后字符无损", norm("".join(out.text_chunks + rest)) == norm(text))
 
 
-def test_reasoning_hidden_by_default() -> None:
-    print("\n[4] 思考内容默认不外泄")
-    r = TurnRenderer(max_length=100)
-    r.handle(ev("response:completion", {"type": "response.reasoning_text.delta", "delta": "秘密推理"}))
-    check("默认不缓冲 reasoning", r.buffer == "", repr(r.buffer))
-    on = TurnRenderer(max_length=100, show_reasoning=True)
-    on.handle(ev("response:completion", {"type": "response.reasoning_text.delta", "delta": "可见推理"}))
-    check("开启后进入缓冲", "可见推理" in on.buffer, on.buffer)
+def test_reasoning_display_modes() -> None:
+    print("\n[4] 思考内容三档：不外泄 / 只提示 / 全文")
+    off = TurnRenderer(max_length=100)
+    reason = {"type": "response.reasoning_text.delta", "delta": "秘密推理"}
+    out = off.handle(ev("response:completion", reason))
+    check("默认一个字都不外泄", out.notes == [] and off.buffer == "", (out.notes, off.buffer))
+
+    hint = TurnRenderer(max_length=100, show_reasoning=True)
+    h1 = hint.handle(ev("response:completion", {"type": "response.reasoning_text.delta", "delta": "先想想"}))
+    h2 = hint.handle(ev("response:completion", {"type": "response.reasoning_text.delta", "delta": "再想想"}))
+    check("简略模式每个块只提示一次", h1.notes == ["💭 正在思考…"] and h2.notes == [], (h1.notes, h2.notes))
+    hdone = hint.handle(ev("chat:completion", {"done": True, "output": []}))
+    check("简略模式不推全文", not any("先想想" in n for n in hdone.notes), hdone.notes)
+
+    alt = TurnRenderer(max_length=100, show_reasoning=True)
+    a1 = alt.handle(ev("response:completion", {"type": "response.reasoning_text.delta", "delta": "第一想"}))
+    alt.handle(text_delta("第一段正文"))
+    a2 = alt.handle(ev("response:completion", {"type": "response.reasoning_text.delta", "delta": "第二想"}))
+    check("思考-正文交替时各块独立提示", a1.notes == ["💭 正在思考…"] and a2.notes == ["💭 正在思考…"],
+          (a1.notes, a2.notes))
+
+    full = TurnRenderer(max_length=100, show_reasoning=True, reasoning_detailed=True)
+    full.handle(ev("response:completion", {"type": "response.reasoning_text.delta", "delta": "推理内容"}))
+    fdone = full.handle(ev("chat:completion", {"done": True, "output": []}))
+    ftext = "".join(fdone.notes)
+    check("全文模式推思考原文", "推理内容" in ftext and ftext.startswith("💭 思考："), ftext)
+    check("思考不污染正文缓冲", full.buffer == "" and full.full_text == "",
+          (repr(full.buffer), full.full_text))
+
+    long = TurnRenderer(max_length=60, show_reasoning=True, reasoning_detailed=True)
+    long.handle(ev("response:completion", {
+        "type": "response.reasoning_text.delta", "delta": "。".join(["思路"] * 80)
+    }))
+    ldone = long.handle(ev("chat:completion", {"done": True, "output": []}))
+    check("超长思考按上限分片", all(len(n) <= 60 for n in ldone.notes), [len(n) for n in ldone.notes])
 
 
-def test_tool_and_status() -> None:
-    print("\n[5] 工具与检索只作进度，不进正文")
-    r = TurnRenderer(max_length=100)
-    out = r.handle(ev("response:completion", {"type": "response.output_item.done", "item": {
-        "type": "function_call", "name": "web_open", "arguments": "{}"
-    }}))
-    check("工具名进进度", any("web_open" in p for p in out.progress), out.progress)
-    check("工具不进正文缓冲", r.buffer == "", r.buffer)
+def test_tool_status_display_modes() -> None:
+    print("\n[5] 工具与检索两档：逐条详情 / 正文前汇总")
+    detail = TurnRenderer(max_length=100, tool_status_detailed=True)
+    d1 = detail.handle(ev("response:completion", {
+        "type": "response.output_item.added",
+        "item": {"type": "function_call", "call_id": "c1", "name": "web_open", "arguments": ""},
+    }))
+    dargs = detail.handle(ev("response:completion", {
+        "type": "response.function_call_arguments.done", "item_id": "c1",
+        "arguments": '{"url":"https://example.com/page"}',
+    }))
+    d2 = detail.handle(ev("response:completion", {
+        "type": "response.output_item.done",
+        "item": {"type": "function_call", "call_id": "c1", "name": "web_open", "arguments": "{}"},
+    }))
+    joined = "\n".join(d1.notes + dargs.notes + d2.notes)
+    check("入参齐了才出声", "调用了 web_open" in joined and "参数：" in joined, joined)
+    check("同一调用不重复发", joined.count("调用了 web_open") == 1, joined)
+    d3 = detail.handle(ev("chat:completion", {"done": True, "output": [
+        {"type": "function_call", "call_id": "c1", "name": "web_open", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1",
+         "output": [{"type": "input_text", "text": "页面正文" * 60}]},
+    ]}))
+    rnote = "".join(d3.notes)
+    check("返回从终态快照回填", "web_open 返回：" in rnote, rnote)
+    check("长返回被截断并标注原长", "…（共 " in rnote, rnote)
+    check("工具不进正文缓冲", detail.buffer == "", repr(detail.buffer))
 
-    out2 = r.handle(ev("status", {"action": "web_search", "description": "搜索: 天气", "done": False}))
-    check("检索状态成进度", len(out2.progress) == 1 and "检索" in out2.progress[0], out2.progress)
+    brief = TurnRenderer(max_length=100)
+    b1 = brief.handle(ev("response:completion", {
+        "type": "response.output_item.added",
+        "item": {"type": "function_call", "call_id": "c1", "name": "read_file"},
+    }))
+    brief.handle(ev("response:completion", {
+        "type": "response.output_item.added",
+        "item": {"type": "function_call", "call_id": "c2", "name": "read_file"},
+    }))
+    b2 = brief.handle(text_delta("汇总正文"))
+    check("链式调用中途不出声", b1.notes == [], b1.notes)
+    check("正文开始前汇总全部", b2.notes == ["🔧 使用了 1 个工具：read_file×2"], b2.notes)
+    brief.handle(ev("response:completion", {
+        "type": "response.output_item.added",
+        "item": {"type": "function_call", "call_id": "c3", "name": "calc"},
+    }))
+    b3 = brief.handle(text_delta("第二段"))
+    check("汇总只算上一段之后的调用", b3.notes == ["🔧 使用了 1 个工具：calc"], b3.notes)
 
-    out3 = r.handle(ev("status", {"action": "web_search", "done": True}))
-    check("同名状态可重复出现（done 语义）", len(out3.progress) == 1, out3.progress)
+    st = TurnRenderer(max_length=100)
+    s1 = st.handle(ev("status", {"action": "web_search", "description": "搜索: 天气", "done": False}))
+    st.handle(ev("status", {"action": "sources_retrieved", "done": True}))
+    s2 = st.handle(text_delta("答"))
+    check("检索先攒进汇总", s1.notes == [] and "联网检索" in "".join(s2.notes), (s1.notes, s2.notes))
+    check("子步骤不重复计数", "已获取参考资料" not in "".join(s2.notes), s2.notes)
+
+    std = TurnRenderer(max_length=100, tool_status_detailed=True)
+    sd = std.handle(ev("status", {"action": "web_search", "description": "搜索: 天气", "done": False}))
+    check("详细模式检索即时出声", len(sd.notes) == 1 and "检索中" in sd.notes[0], sd.notes)
+    sdone = std.handle(ev("status", {"action": "web_search", "done": True}))
+    check("完成态另发一条", len(sdone.notes) == 1 and "完成" in sdone.notes[0], sdone.notes)
+
+    cc = TurnRenderer(max_length=100).handle(ev("context_compaction", {"action": "context_compaction"}))
+    check("上下文压缩始终提示", "上下文压缩" in "".join(cc.notes), cc.notes)
 
     quiet = TurnRenderer(max_length=100, show_tool_status=False)
     q1 = quiet.handle(ev("status", {"action": "web_search", "done": False}))
-    q2 = quiet.handle(ev("response:completion", {"type": "response.output_item.done",
-                                                 "item": {"type": "function_call", "name": "t"}}))
-    check("关闭进度后 status 静默", q1.progress == [], q1.progress)
-    check("关闭进度后工具静默", q2.progress == [], q2.progress)
+    q2 = quiet.handle(ev("response:completion", {
+        "type": "response.output_item.done",
+        "item": {"type": "function_call", "call_id": "x", "name": "t"},
+    }))
+    q3 = quiet.handle(text_delta("正文"))
+    check("关闭后 status 静默", q1.notes == [], q1.notes)
+    check("关闭后工具静默", q2.notes == [], q2.notes)
+    check("关闭后无汇总", q3.notes == [], q3.notes)
 
 
 def test_sources_tail() -> None:
@@ -188,7 +267,7 @@ def test_error_and_cancel() -> None:
 
     r3 = TurnRenderer(max_length=100)
     out3 = r3.handle(ev("chat:tasks:cancel", None))
-    check("中断有进度提示", out3.progress and "中断" in out3.progress[0], out3.progress)
+    check("中断有侧栏提示", out3.notes and "中断" in out3.notes[0], out3.notes)
     check("中断置 done", out3.done is True)
 
 
@@ -590,8 +669,8 @@ async def main() -> None:
     test_basic_text()
     test_heading_split()
     test_max_length_split()
-    test_reasoning_hidden_by_default()
-    test_tool_and_status()
+    test_reasoning_display_modes()
+    test_tool_status_display_modes()
     test_sources_tail()
     test_error_and_cancel()
     test_fallback_from_output()

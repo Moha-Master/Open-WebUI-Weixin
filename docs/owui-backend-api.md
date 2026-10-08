@@ -340,9 +340,15 @@ sio.connect(
 | ├ `response.output_text.delta` | `{"delta": "..."}` | 正文增量，**主要靠这个打字机** |
 | ├ `response.reasoning_text.delta` | `{"delta": "..."}` | 推理内容（可选展示） |
 | ├ `response.output_item.added` / `.done` | `{"item": {"type": "function_call", "name": "..."}}` | 工具调用开始/结束，可显示"正在调用 X" |
+| ├ `response.function_call_arguments.delta` / `.done` | `{"item_id": ..., "delta"/"arguments": "..."}` | 工具入参（`added` 时 `arguments` 常为空串，**要等这里或 `.done`**） |
+| ├ `response.reasoning_summary_text.delta` | `{"delta": "..."}` | 推理摘要增量（OpenAI 系模型走这条，与 `reasoning_text.delta` 二选一） |
 | └ `response.completed` | `{"output": [...]}` | 终态结构化输出条目数组 |
 | `chat:completion` | `{"done": true, "output": [...], "title": "?", "error": "?"}` | **回合结束信号**。`error` 为真值表示失败；`done` 时若一个 delta 都没收到，可用 `output` 兜底取全文避免空回复 |
 | `status` | `{"action": "...", "description": "...", "done": bool}` | 进度：`web_search`、`web_search_queries_generated`、`sources_retrieved`、`knowledge_search`、`context_compaction` 等 |
+
+**工具返回拿不到增量（源码核对）**：后端执行完工具只把 `{"type": "function_call_output", "call_id": ..., "output": [{"type": "input_text", "text": ...}]}` append 进 `output` 数组，**不发 `output_item.added/.done`**（`utils/middleware.py:6156`），所以返回值只能在终态 `chat:completion` 的 `output` 快照里按 `call_id` 回填。网页端同理——它是靠 `applyResponseStreamEvent` 折全量快照才渲染出结果的（`structuredOutput.ts:344-390`）。
+
+**`continuing` 模式换通道（源码核对）**：`continuing = bool(metadata['assistant_message_id'])`，只有客户端显式带 `assistant_message_id` 才为真（`main.py:1273` 从 form_data pop，`id` 字段不算）。为真时后端把事件外层从 `response:completion` 换成 `chat:completion`，载荷变成 `{"output": 全量快照, "type": 最后一条增量类型}`（`utils/middleware.py:5012/5064`）——只订阅增量的客户端在这种模式下会整轮失聪，两种形状都要吃。
 | `context_compaction` | 同上 | 上下文压缩（长对话会被压缩） |
 | `source` / `citation` | `{"source": {"name": ...}, "document": [{"source": {"url": ...}}]}` | 联网/知识库引用来源 |
 | `chat:title` | `"标题字符串"` | 后台生成的会话标题 |

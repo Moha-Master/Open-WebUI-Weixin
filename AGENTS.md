@@ -95,6 +95,8 @@
 - `open_webui_weixin/login.py`：扫码登录状态机 + ASCII 二维码（`user add` 与 `/relogin` 共用）。confirmed 后 `state.save_login` 落库；`local_token_list` 只是申请二维码时的报备字段，**不是账号配额**。
 - `open_webui_weixin/render.py`：OWUI 事件 → 微信消息序列的渲染状态机。
   - 分片优先按 Markdown 结构切：标题行前切（`#`/`##` 同档 → `###` … 逐级降级，无标题则不切）、真·分隔线（`---`/`***`/`___`，非 Setext 下划线、非表格分隔行）连同前文推出；长度上限仅作超限兜底（句子边界硬切）。围栏代码块（```` ``` ```` / `~~~` / `:::`）、`$$` 公式块、表格、列表整块保护，不允许在块内切点。
+  - **侧栏通道** `RenderedEvent.notes`（思考提示、工具详情/汇总、检索状态、上下文压缩）与 `text_chunks` 分开发送：各自成一条微信消息保时序，且不得混进 `full_text`（临时聊天存的历史正文只能是模型答复）。
+  - `display` 双轴：`reasoning.enable/detailed`、`tool_status.enable/detailed`。思考的 detailed 走 `narration` 缓冲（只按长度兜底切，不做 Markdown 结构切分）；工具的 detailed=逐条「🔧 调用了 X / 参数… / ↩ X 返回…」，非 detailed=在**每段正文开始前**结算「上一段之后用了哪些工具」（`in_summary` 记账，同名合并计数 `a×2`）。`context_compaction` 两种模式都出声（它解释延迟，不是工具）。
 
 ---
 
@@ -119,6 +121,7 @@
 2. **`tools` 键陷阱**：请求体中一旦出现 `tools` 键（哪怕是 `[]`），后端会跳过所有 `tool_ids` 解析。
 3. **模型参数缺失**：`/api/models` 接口会剥除 `info.params`，导致适配器无法得知模型是否支持 legacy function calling。
 4. **JWT 过期**：本项目仅支持 JWT 认证。若 `JWT_EXPIRES_IN=-1`，`/status` 应显示"长期有效"。
+5. **工具调用事件形状**：原生 function calling 下调用侧事件齐（`response.output_item.added/done` 带 `function_call`、`response.function_call_arguments.delta/.done` 带入参），但**工具返回 `function_call_output` 只 append 到 output 数组、不单独成事件**（`middleware.py:6156`），只能在终态 `chat:completion` 的 `output` 快照里取。另外 `continuing = bool(metadata['assistant_message_id'])`（客户端显式带该字段才为真，`main.py:1273`），为真时后端**改发 `chat:completion` 全量 output 快照**而不再发 `response:completion` 增量（`middleware.py:5012/5064`）——只认增量的客户端会整轮失聪。
 
 ---
 

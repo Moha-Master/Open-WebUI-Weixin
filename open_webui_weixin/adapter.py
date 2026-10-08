@@ -362,10 +362,10 @@ class Adapter:
             if result.sent_segments == 0 and not result.error:
                 await self.send_text(wechat_user_id, "（本轮没有可显示的文本回复）")
             log.info(
-                "回合结束 chat=%s 分片=%d 进度=%d%s",
+                "回合结束 chat=%s 分片=%d 说明=%d%s",
                 (result.chat_id or "-")[:8],
                 result.sent_segments,
-                len(result.progress_lines),
+                len(result.note_lines),
                 f" 错误={result.error}" if result.error else "",
             )
 
