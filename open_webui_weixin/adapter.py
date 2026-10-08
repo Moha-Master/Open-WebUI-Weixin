@@ -1,4 +1,17 @@
-"""主循环：微信长轮询 -> 命令/聊天分发 -> 微信回复。"""
+"""主循环：多 bot 账号并行长轮询 -> 命令/聊天分发 -> 微信回复。
+
+多账号模型（与微信 ClawBot 产品形态对齐）：
+- 一个 bot 账号由扫码者的微信号派生，服务对象就是扫码者本人；
+- 多用户 = 多 bot 账号：每账号一次 `owux user add` 扫码，服务端同时持有多个 token；
+- 服务进程为每个账号各起一条长轮询任务（独立 client/游标/typing），
+  watcher 定期比对库里的账号集合，热加载新账号、摘除被删除的账号；
+- 单账号会话过期（-14）只停该账号并提示重新授权，其余账号不受影响。
+
+发送路径：回复必须从**消息到达的那个账号**发出（该账号的 bot token + 该
+(bot, wxid) 的 context_token）。一个微信号同一时间只绑一个 bot（重复扫码会
+解绑前绑），所以 wxid -> account 的映射稳定：进程内入站时记录，重启后从
+context_token 表兜底反查。
+"""
 
 from __future__ import annotations
 
@@ -27,22 +40,51 @@ from .weixin_protocol import (
 
 log = logging.getLogger(__name__)
 
-# 会话过期后的静默时长，与官方实现一致（1 小时）
-SESSION_EXPIRED_COOLDOWN = 3600
+# 账号热加载的比对周期
+ACCOUNT_WATCH_INTERVAL = 30.0
+# 长轮询失败的退避序列
 RETRY_BACKOFF = [2, 5, 15, 30, 60]
 # JWT 到期前多久主动提示用户刷新
 JWT_REFRESH_HINT_WINDOW = 3 * 24 * 3600
+
+
+class AccountHandle:
+    """一个 bot 账号的运行时：独立 token、HTTP 客户端与 typing 维护器。"""
+
+    def __init__(
+        self,
+        account_id: str,
+        token: str,
+        base_url: str,
+        client: IlinkClient,
+        typing: TypingKeeper | None = None,
+    ) -> None:
+        self.account_id = account_id
+        self.token = token
+        self.base_url = base_url
+        self.client = client
+        self.typing = typing
+        self.task: asyncio.Task | None = None
+
+    async def close(self) -> None:
+        if self.task and not self.task.done():
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.task
+        if self.typing is not None:
+            await self.typing.close()
+        await self.client.close()
 
 
 class Adapter:
     def __init__(self, cfg: AppConfig, state: StateStore, client: IlinkClient, owui: OwuiClient) -> None:
         self.cfg = cfg
         self.state = state
+        # self.client 仅用于扫码登录流程（不需要账号 token）；各账号收发用自己的 client
         self.client = client
         self.owui = owui
         self.login_flow = LoginFlow(client, state, cfg.weixin.bot_type)
         self.runtimes = RuntimeManager(owui, cfg.owui.base_url)
-        self.typing = TypingKeeper(client, lambda: self._token, enabled=cfg.display.typing)
         self.commands = CommandHandler(
             cfg,
             state,
@@ -53,82 +95,154 @@ class Adapter:
             ),
             login_flow=self.login_flow,
         )
-        self._token = ""
+        self._accounts: dict[str, AccountHandle] = {}
+        # wxid -> account_id：入站时维护；发送路径据此选择账号
+        self._user_account: dict[str, str] = {}
         self._stop = asyncio.Event()
-        self._session_expired_at = 0.0
+        self._watcher: asyncio.Task | None = None
 
-    # ---------- 微信登录态 ----------
+    # ---------- 登录态 ----------
 
     def restore_login(self) -> bool:
-        """尝试从本地恢复微信登录凭据，成功返回 True。"""
-        return self._restore_token()
+        """是否已有已授权账号（--check 用；服务模式不负责扫码）。"""
+        return bool(self.state.load_accounts())
 
-    def _restore_token(self) -> bool:
-        row = self.state.load_session()
-        if row is None:
-            return False
-        self._token = row["bot_token"]
-        if row["base_url"]:
-            self.client.base_url = row["base_url"]
-        log.info("已恢复微信登录态：bot_id=%s", row["account_id"])
-        return True
+    # ---------- 账号生命周期 ----------
 
-    async def ensure_login(self) -> None:
-        if self._restore_token():
-            return
-        log.warning("未发现微信登录凭据，进入扫码流程")
-        result = await self.login_flow.run()
-        self._token = result["bot_token"]
-        self.client.base_url = result["base_url"] or self.client.base_url
+    def _start_account(self, row) -> AccountHandle:
+        account_id = row["account_id"]
+        base_url = row["base_url"] or self.cfg.weixin.base_url
+        client = IlinkClient(
+            base_url=base_url,
+            cdn_base_url=self.cfg.weixin.cdn_base_url,
+            channel_version=self.cfg.weixin.channel_version,
+            bot_agent=self.cfg.weixin.bot_agent,
+            api_timeout_ms=self.cfg.weixin.api_timeout_ms,
+            long_poll_timeout_ms=self.cfg.weixin.long_poll_timeout_ms,
+        )
+        handle = AccountHandle(account_id, row["bot_token"], base_url, client)
+        handle.typing = TypingKeeper(client, lambda: handle.token, enabled=self.cfg.display.typing)
+        self._accounts[account_id] = handle
+        handle.task = asyncio.create_task(self._poll_loop(handle))
+        log.info("账号 %s 开始监听微信消息（长轮询）", short_id(account_id))
+        return handle
 
-    async def handle_session_expired(self) -> None:
-        """-14：清理登录态，静默一段时间后重新扫码。"""
-        log.error("微信会话已过期（-14），需要重新扫码登录")
-        self.state.clear_session()
-        self._token = ""
-        self._session_expired_at = asyncio.get_running_loop().time()
+    async def _stop_account(self, account_id: str) -> None:
+        handle = self._accounts.pop(account_id, None)
+        if handle is not None:
+            await handle.close()
 
-    # ---------- 主循环 ----------
+    async def _account_expired(self, handle: AccountHandle) -> None:
+        """-14：只清理该账号；其余账号继续服务。重新授权走 `owux user add`。"""
+        log.error(
+            "账号 %s 的微信会话已过期（-14），已停止该账号。"
+            "请运行 `owux user add` 并用原微信号重新扫码授权。",
+            short_id(handle.account_id),
+        )
+        handle.token = ""
+        self.state.clear_account(handle.account_id)
+        self._user_account = {
+            uid: acc for uid, acc in self._user_account.items() if acc != handle.account_id
+        }
 
     def request_stop(self) -> None:
         self._stop.set()
 
     async def run(self) -> None:
-        await self.ensure_login()
-        try:
-            await self.client.notify_start(self._token)
-        except IlinkError as exc:
-            log.warning("notifyStart 失败（继续运行）: %s", exc)
+        accounts = self.state.load_accounts()
+        if not accounts:
+            log.error("没有任何微信账号。请先运行 `owux user add` 扫码添加账号，再启动服务。")
+            return
 
-        log.info("开始监听微信消息（长轮询）")
+        for row in accounts:
+            self._start_account(row)
+        self._watcher = asyncio.create_task(self._watch_accounts())
+        try:
+            await self._stop.wait()
+        finally:
+            if self._watcher:
+                self._watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._watcher
+            for handle in list(self._accounts.values()):
+                await handle.close()
+            for task in self.runtimes.active_tasks():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            await self.runtimes.shutdown()
+
+    async def _watch_accounts(self) -> None:
+        """热加载循环：服务运行期间新增/重扫/删除的账号，无需重启即可生效。"""
+        while not self._stop.is_set():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=ACCOUNT_WATCH_INTERVAL)
+            if self._stop.is_set():
+                return
+            try:
+                await self._sync_accounts_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # 热加载循环绝不能因一轮失败而退出
+                log.exception("账号热加载轮次异常，下一轮继续")
+
+    async def _sync_accounts_once(self) -> None:
+        """比对库里账号集合与运行中集合：接入新账号、切换重授权、摘除已删除。"""
+        try:
+            desired = {row["account_id"]: row for row in self.state.load_accounts()}
+        except Exception:
+            log.exception("读取账号列表失败，跳过本轮")
+            return
+        for account_id, row in desired.items():
+            handle = self._accounts.get(account_id)
+            if handle is None:
+                log.info("发现新账号 %s，自动接入服务", short_id(account_id))
+                self._start_account(row)
+            elif handle.token != row["bot_token"]:
+                log.info("账号 %s 的登录态已更新，切换到新凭据", short_id(account_id))
+                await self._stop_account(account_id)
+                self._start_account(row)
+            elif handle.task is not None and handle.task.done():
+                # 轮询任务因意外异常终止：凭据未变也要自愈重启
+                log.warning("账号 %s 的长轮询意外终止，重启", short_id(account_id))
+                await self._stop_account(account_id)
+                self._start_account(row)
+        for account_id in list(self._accounts):
+            if account_id not in desired:
+                log.info("账号 %s 已移除，停止其长轮询", short_id(account_id))
+                await self._stop_account(account_id)
+
+    async def _backoff(self, failures: int) -> None:
+        delay = RETRY_BACKOFF[min(failures, len(RETRY_BACKOFF) - 1)]
+        log.info("%d 秒后重试", delay)
+        # 可中断的退避：stop 时立刻返回
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._stop.wait(), timeout=delay)
+
+    # ---------- 单账号长轮询 ----------
+
+    async def _poll_loop(self, handle: AccountHandle) -> None:
+        account_id = handle.account_id
         failures = 0
         try:
-            while not self._stop.is_set():
-                now = asyncio.get_running_loop().time()
-                in_cooldown = bool(self._session_expired_at) and (
-                    now - self._session_expired_at < SESSION_EXPIRED_COOLDOWN
-                )
-                if in_cooldown:
-                    await asyncio.sleep(10)
-                    continue
-                if not self._token:
-                    try:
-                        await self.ensure_login()
-                        failures = 0
-                    except Exception as exc:
-                        log.error("扫码登录失败：%s，稍后重试", exc)
-                        await self._backoff(failures)
-                        failures += 1
-                        continue
+            try:
+                await handle.client.notify_start(handle.token)
+            except IlinkError as exc:
+                log.warning("notifyStart 失败（继续运行）[%s]: %s", short_id(account_id), exc)
+            log.info("账号 %s 就绪（base_url=%s）", short_id(account_id), handle.base_url)
 
+            while not self._stop.is_set() and handle.token:
                 try:
-                    data = await self.client.get_updates(self._token, self.state.sync_buf)
+                    data = await handle.client.get_updates(
+                        handle.token, self.state.get_sync_buf(account_id)
+                    )
                     failures = 0
                 except SessionExpiredError:
-                    await self.handle_session_expired()
-                    continue
+                    await self._account_expired(handle)
+                    return
                 except IlinkError as exc:
-                    log.warning("长轮询失败：%s", exc)
+                    log.warning("长轮询失败 [%s]：%s", short_id(account_id), exc)
                     await self._backoff(failures)
                     failures += 1
                     continue
@@ -136,31 +250,25 @@ class Adapter:
                 new_buf = data.get("get_updates_buf")
                 if isinstance(new_buf, str) and new_buf:
                     # 游标必须及时落盘，否则重启会重复拉取或漏拉
-                    self.state.sync_buf = new_buf
+                    self.state.set_sync_buf(account_id, new_buf)
 
                 for msg in data.get("msgs") or []:
-                    await self._dispatch(msg)
+                    # 单条消息的处理异常不允许打死该账号的轮询
+                    try:
+                        await self._dispatch(handle, msg)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception("处理入站消息失败 [%s]", short_id(account_id))
         finally:
-            for task in list(self._worker_tasks()):
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-            await self.runtimes.shutdown()
-            await self.typing.close()
-            with contextlib.suppress(Exception):
-                await self.client.notify_stop(self._token)
-
-    async def _backoff(self, failures: int) -> None:
-        delay = RETRY_BACKOFF[min(failures, len(RETRY_BACKOFF) - 1)]
-        log.info("%d 秒后重试", delay)
-        await asyncio.sleep(delay)
-
-    def _worker_tasks(self) -> list[asyncio.Task]:
-        return self.runtimes.active_tasks()
+            if handle.token:
+                with contextlib.suppress(Exception):
+                    await handle.client.notify_stop(handle.token)
+            log.info("账号 %s 的长轮询已退出", short_id(account_id))
 
     # ---------- 消息处理 ----------
 
-    async def _dispatch(self, msg: dict[str, Any]) -> None:
+    async def _dispatch(self, handle: AccountHandle, msg: dict[str, Any]) -> None:
         if int(msg.get("message_type") or 0) != MESSAGE_TYPE_USER:
             return
         wechat_user_id = str(msg.get("from_user_id") or "").strip()
@@ -170,7 +278,8 @@ class Adapter:
 
         context_token = str(msg.get("context_token") or "").strip()
         if context_token:
-            self.state.save_context_token(wechat_user_id, context_token)
+            self.state.save_context_token(handle.account_id, wechat_user_id, context_token)
+        self._user_account[wechat_user_id] = handle.account_id
 
         text = extract_text(msg)
         if not text:
@@ -201,6 +310,7 @@ class Adapter:
             return
 
         rt = self.runtimes.get(wechat_user_id)
+        rt.account_id = self._account_id_for(wechat_user_id)
         if len(rt.pending) >= PENDING_LIMIT:
             await self.send_text(wechat_user_id, f"前面已排队 {len(rt.pending)} 条，发送 /stop 可清空重来。")
             return
@@ -233,19 +343,19 @@ class Adapter:
 
             runner = ChatRunner(self.cfg, self.state, self.owui, socket, self.send_text)
             # 生成期间显示原生「正在输入」，替代刷屏式的进度
-            await self.typing.start(wechat_user_id, "turn")
+            await self._typing_start(rt.account_id, wechat_user_id)
             async with rt.lock:
                 try:
                     result = await runner.run_turn(wechat_user_id, jwt_token, combined)
                 except asyncio.CancelledError:
-                    await self.typing.stop(wechat_user_id, "turn")
+                    await self._typing_stop(rt.account_id, wechat_user_id)
                     raise
                 except Exception:
                     log.exception("生成回合异常")
-                    await self.typing.stop(wechat_user_id, "turn")
+                    await self._typing_stop(rt.account_id, wechat_user_id)
                     await self.send_text(wechat_user_id, "生成时发生内部错误，请稍后重试。")
                     continue
-            await self.typing.stop(wechat_user_id, "turn")
+            await self._typing_stop(rt.account_id, wechat_user_id)
 
             if result.error:
                 await self.send_text(wechat_user_id, f"❌ {result.error}")
@@ -322,8 +432,35 @@ class Adapter:
 
     # ---------- 出站 ----------
 
+    def _account_id_for(self, wechat_user_id: str) -> str:
+        """wxid -> account_id：优先进程内入站映射，退回 context_token 表兜底。"""
+        account_id = self._user_account.get(wechat_user_id)
+        if account_id:
+            return account_id
+        account_id = self.state.account_for_user(wechat_user_id)
+        if account_id:
+            self._user_account[wechat_user_id] = account_id
+        return account_id
+
+    async def _typing_start(self, account_id: str, wechat_user_id: str) -> None:
+        handle = self._accounts.get(account_id)
+        if handle is not None and handle.typing is not None:
+            await handle.typing.start(wechat_user_id, "turn")
+
+    async def _typing_stop(self, account_id: str, wechat_user_id: str) -> None:
+        handle = self._accounts.get(account_id)
+        if handle is not None and handle.typing is not None:
+            await handle.typing.stop(wechat_user_id, "turn")
+
     async def send_text(self, wechat_user_id: str, text: str) -> None:
-        context_token = self.state.get_context_token(wechat_user_id)
+        account_id = self._account_id_for(wechat_user_id)
+        if not account_id:
+            log.error(
+                "无法回复 [%s]：该用户从未在本服务的任何账号下发过消息", short_id(wechat_user_id)
+            )
+            return
+
+        context_token = self.state.get_context_token(account_id, wechat_user_id)
         if not context_token:
             # 没有 context_token 时服务端返回 200 但静默丢弃，必须显式失败
             log.error(
@@ -331,12 +468,17 @@ class Adapter:
             )
             return
 
+        handle = self._accounts.get(account_id)
+        if handle is None or not handle.token:
+            log.error("账号 %s 未在服务中，无法回复 [%s]", short_id(account_id), short_id(wechat_user_id))
+            return
+
         segments = split_text(text, self.cfg.reply)
         for i, segment in enumerate(segments):
             try:
-                await self.client.send_text(self._token, wechat_user_id, segment, context_token)
+                await handle.client.send_text(handle.token, wechat_user_id, segment, context_token)
             except SessionExpiredError:
-                await self.handle_session_expired()
+                await self._account_expired(handle)
                 return
             except IlinkError as exc:
                 log.error("发送失败: %s", exc)
@@ -345,14 +487,19 @@ class Adapter:
                 await asyncio.sleep(self.cfg.reply.segment_interval)
 
     async def send_items(self, wechat_user_id: str, item_list: list[dict[str, Any]]) -> None:
-        context_token = self.state.get_context_token(wechat_user_id)
+        account_id = self._account_id_for(wechat_user_id)
+        context_token = self.state.get_context_token(account_id, wechat_user_id) if account_id else ""
         if not context_token:
             log.error("缺少 context_token，无法发送富消息")
             return
+        handle = self._accounts.get(account_id)
+        if handle is None:
+            log.error("账号 %s 未在服务中，无法发送富消息", short_id(account_id))
+            return
         try:
-            await self.client.send_message(self._token, wechat_user_id, item_list, context_token)
+            await handle.client.send_message(handle.token, wechat_user_id, item_list, context_token)
         except SessionExpiredError:
-            await self.handle_session_expired()
+            await self._account_expired(handle)
         except IlinkError as exc:
             log.error("发送失败: %s", exc)
 

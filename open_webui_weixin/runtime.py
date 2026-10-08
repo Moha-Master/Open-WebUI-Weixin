@@ -29,6 +29,8 @@ PENDING_LIMIT = 5
 @dataclass
 class UserRuntime:
     wechat_user_id: str
+    account_id: str = ""  # 该用户消息来自哪个 bot 账号（发送路径据此选择）
+    socket: OwuiSocket | None = None
     socket: OwuiSocket | None = None
     jwt_token: str = ""
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)

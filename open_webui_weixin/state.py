@@ -23,6 +23,11 @@ log = logging.getLogger(__name__)
 # 待确认动作有效期
 CONFIRM_TTL = 180
 
+
+def _sync_buf_key(account_id: str) -> str:
+    """长轮询游标在 meta 表里的 per-account 键名。"""
+    return f"sync_buf:{account_id}"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -38,10 +43,14 @@ CREATE TABLE IF NOT EXISTS weixin_session (
     updated_at       INTEGER NOT NULL
 );
 
+-- context_token 是 (bot, wxid) 维度的路由锚点：同一微信号理论上只属于一个 bot，
+-- 但键上带 account_id 才能保证账号重扫/移除时互不串扰
 CREATE TABLE IF NOT EXISTS context_token (
-    wechat_user_id TEXT PRIMARY KEY,
+    account_id     TEXT NOT NULL,
+    wechat_user_id TEXT NOT NULL,
     context_token  TEXT NOT NULL,
-    updated_at     INTEGER NOT NULL
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (account_id, wechat_user_id)
 );
 
 CREATE TABLE IF NOT EXISTS binding (
@@ -109,17 +118,53 @@ class StateStore:
         self._conn = sqlite3.connect(str(path), isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # `user add` 子命令与服务主进程会同时写这个库，冲突时等待而不是立刻报错
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._harden_file_perms()
         log.info("状态库就绪: %s", path)
 
     def _migrate(self) -> None:
-        """给旧库补列：CREATE TABLE IF NOT EXISTS 不会改动已存在的表。"""
+        """给旧库补列/重建：CREATE TABLE IF NOT EXISTS 不会改动已存在的表。"""
         cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(focus)")}
         if "temporary" not in cols:
             self._conn.execute("ALTER TABLE focus ADD COLUMN temporary INTEGER NOT NULL DEFAULT 0")
             log.info("focus 表已补 temporary 列（临时聊天模式标记）")
+
+        ctx_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(context_token)")}
+        if "account_id" not in ctx_cols:
+            self._migrate_context_token()
+            log.info("context_token 表已升级为 (account_id, wechat_user_id) 复合键")
+
+        # 全局游标 -> per-account 游标：旧值归给现有唯一账号
+        legacy_buf = self.get_meta("weixin_sync_buf")
+        if legacy_buf:
+            accounts = self._conn.execute("SELECT account_id FROM weixin_session").fetchall()
+            if len(accounts) == 1:
+                self.set_meta(_sync_buf_key(accounts[0]["account_id"]), legacy_buf)
+                log.info("已把全局长轮询游标迁移到唯一账号 %s", accounts[0]["account_id"][:12])
+            else:
+                log.info("丢弃旧全局游标（账号数=%d，无法归属）", len(accounts))
+            self._conn.execute("DELETE FROM meta WHERE key = 'weixin_sync_buf'")
+
+    def _migrate_context_token(self) -> None:
+        """旧表主键是 wechat_user_id，重建为 (account_id, wechat_user_id) 复合键。"""
+        rows = self._conn.execute(
+            "SELECT wechat_user_id, context_token, updated_at FROM context_token"
+        ).fetchall()
+        owner = self._conn.execute(
+            "SELECT account_id FROM weixin_session ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        account_id = owner["account_id"] if owner else ""
+        self._conn.execute("DROP TABLE context_token")
+        self._conn.executescript(SCHEMA)
+        for row in rows:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO context_token"
+                "(account_id, wechat_user_id, context_token, updated_at) VALUES(?, ?, ?, ?)",
+                (account_id, row["wechat_user_id"], row["context_token"], row["updated_at"]),
+            )
 
     def _harden_file_perms(self) -> None:
         """把 db 及其 WAL/SHM 伴生文件收紧到 0600。"""
@@ -145,17 +190,22 @@ class StateStore:
             (key, value),
         )
 
-    # ---------- 微信登录态 ----------
+    # ---------- 长轮询游标（per-account）----------
 
-    @property
-    def sync_buf(self) -> str:
-        return self.get_meta("weixin_sync_buf")
+    def get_sync_buf(self, account_id: str) -> str:
+        return self.get_meta(_sync_buf_key(account_id))
 
-    @sync_buf.setter
-    def sync_buf(self, value: str) -> None:
-        self.set_meta("weixin_sync_buf", value)
+    def set_sync_buf(self, account_id: str, value: str) -> None:
+        self.set_meta(_sync_buf_key(account_id), value)
+
+    # ---------- 微信登录态（多账号）----------
 
     def save_login(self, result: dict[str, Any]) -> None:
+        """写入/更新一个 bot 账号的登录态。副作用只作用于该账号自己的数据。
+
+        旧实现会全局清空游标和 context_token——多账号下第二个用户扫码会毁掉
+        第一个账号的路由锚点，所以全部改为 per-account。
+        """
         now = int(time.time())
         account_id = result.get("bot_id") or "default"
         self._conn.execute(
@@ -176,11 +226,12 @@ class StateStore:
                 now,
             ),
         )
-        # 新登录意味着游标与上下文全部作废
-        self.sync_buf = ""
-        self._conn.execute("DELETE FROM context_token")
+        # 该账号换了新令牌：只作废它自己的游标与路由锚点，不碰其它账号
+        self.set_meta(_sync_buf_key(account_id), "")
+        self._conn.execute("DELETE FROM context_token WHERE account_id = ?", (account_id,))
         tokens = self._known_tokens()
-        tokens.append(result["bot_token"])
+        if result["bot_token"] not in tokens:
+            tokens.append(result["bot_token"])
         self.set_meta("weixin_known_tokens", "|".join(tokens[-10:]))
 
     def _known_tokens(self) -> list[str]:
@@ -191,32 +242,55 @@ class StateStore:
         """扫码时上报本地已有 token，服务端据此识别重复绑定。"""
         return self._known_tokens()
 
+    def load_accounts(self) -> list[sqlite3.Row]:
+        return list(self._conn.execute("SELECT * FROM weixin_session ORDER BY created_at"))
+
     def load_session(self) -> sqlite3.Row | None:
+        """单账号场景兼容入口：返回最近授权的一个账号（同秒内以后入库者为准）。"""
         return self._conn.execute(
-            "SELECT * FROM weixin_session ORDER BY updated_at DESC LIMIT 1"
+            "SELECT * FROM weixin_session ORDER BY updated_at DESC, rowid DESC LIMIT 1"
         ).fetchone()
 
+    def clear_account(self, account_id: str) -> None:
+        """移除一个 bot 账号的登录态与其路由锚点；用户的 OWUI 绑定保留（重加后自动恢复）。"""
+        self._conn.execute("DELETE FROM weixin_session WHERE account_id = ?", (account_id,))
+        self._conn.execute("DELETE FROM context_token WHERE account_id = ?", (account_id,))
+        self.set_meta(_sync_buf_key(account_id), "")
+        log.info("已清理账号 %s 的微信登录态", account_id[:12])
+
     def clear_session(self) -> None:
+        """清空全部微信登录态（保留用户绑定）。"""
         self._conn.execute("DELETE FROM weixin_session")
         self._conn.execute("DELETE FROM context_token")
-        self.sync_buf = ""
-        log.info("已清理微信登录态，下次启动将重新扫码")
+        log.info("已清理全部微信登录态，重新使用需再次扫码")
 
     # ---------- context_token ----------
 
-    def save_context_token(self, wechat_user_id: str, context_token: str) -> None:
+    def save_context_token(self, account_id: str, wechat_user_id: str, context_token: str) -> None:
         self._conn.execute(
-            "INSERT INTO context_token(wechat_user_id, context_token, updated_at) VALUES(?, ?, ?) "
-            "ON CONFLICT(wechat_user_id) DO UPDATE SET context_token = excluded.context_token, "
-            "updated_at = excluded.updated_at",
-            (wechat_user_id, context_token, int(time.time())),
+            "INSERT INTO context_token(account_id, wechat_user_id, context_token, updated_at)"
+            " VALUES(?, ?, ?, ?)"
+            " ON CONFLICT(account_id, wechat_user_id) DO UPDATE SET"
+            " context_token = excluded.context_token, updated_at = excluded.updated_at",
+            (account_id, wechat_user_id, context_token, int(time.time())),
         )
 
-    def get_context_token(self, wechat_user_id: str) -> str:
+    def get_context_token(self, account_id: str, wechat_user_id: str) -> str:
         row = self._conn.execute(
-            "SELECT context_token FROM context_token WHERE wechat_user_id = ?", (wechat_user_id,)
+            "SELECT context_token FROM context_token"
+            " WHERE account_id = ? AND wechat_user_id = ?",
+            (account_id, wechat_user_id),
         ).fetchone()
         return row["context_token"] if row else ""
+
+    def account_for_user(self, wechat_user_id: str) -> str:
+        """按 context_token 存在性反推用户所属账号（发送路径的兜底定位）。"""
+        row = self._conn.execute(
+            "SELECT account_id FROM context_token WHERE wechat_user_id = ?"
+            " ORDER BY updated_at DESC LIMIT 1",
+            (wechat_user_id,),
+        ).fetchone()
+        return row["account_id"] if row else ""
 
     # ---------- 绑定 ----------
 

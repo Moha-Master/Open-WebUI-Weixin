@@ -7,7 +7,8 @@
 
 - **工作目录**：`/webservices/open-webui-weixin`
 - **OWUI 实例**：通常运行在 `http://127.0.0.1:8901` (Host 网络)
-- **微信协议**：iLink 长连接轮询，仅支持单聊，无 `context_token`。
+- **微信协议**：iLink 长连接轮询，仅支持单聊；回复必须携带该 (bot, wxid) 最近一次入站消息下发的 `context_token`（缺失时服务端返回 200 但静默丢弃）。
+- **多账号**：一个 bot = 扫码者本人的「AI 分身」，多用户 = 多 bot 账号（见核心设计原则 5）。
 
 ---
 
@@ -45,10 +46,14 @@
 
 ### 3. 存储与状态
 - **SQLite（工作目录下 `data/state.db`，默认 `~/.config/open-webui-weixin/data/`）**：仅存储持久暂态，代码目录不放数据。
+  - `weixin_session`：每个 bot 账号一行（`account_id`=bot_id、`bot_token`、`base_url`、`scanner_user_id`、时间戳）。
+  - `context_token`：**bot 域**路由锚点，复合主键 `(account_id, wechat_user_id)`。
+  - `meta` 键 `sync_buf:{account_id}`：各账号独立的长轮询游标（旧版全局键 `weixin_sync_buf` 已在 `_migrate` 中迁移）。
   - `binding`：微信 ID 与 OWUI 用户/JWT 的绑定。
   - `snapshot`：会话和模型的序号快照（用于 `/chat del 1` 这种序号操作）。
   - `focus`：用户当前的焦点会话和焦点模型；`temporary` 列记录是否处于临时聊天模式。
   - `temporary_chat`：临时聊天的对话内容（每用户一行，JSON 数组）。网页端临时聊天靠浏览器内存保存历史，微信没有前端，所以由本表代管，新建/退出时清空。
+  - **MUST**：连接状态库时保持 `PRAGMA busy_timeout=5000`（`user add` 独立进程与服务主进程同库并发写）。
 - **序号核实**：执行写操作（删除/重命名）前，必须通过 `get_chat(id)` 直查确认该会话确实存在，不能仅依赖快照。
 
 ### 4. 临时聊天（对齐 WebUI 的 Temporary Chat）
@@ -58,6 +63,20 @@
 - **不碰持久焦点断点**：临时回合成功后只写 `temporary_chat`，不改 `focus` 的 `chat_id/leaf_id`，退出后能无缝续聊；失败回合不落账。
 - **退出即丢弃**：`/chat new`、`/chat attach` 在临时模式下先挂待确认，`/yes` 才退出并清空记录再执行；`/chat list|del|archive|rename` 只作用于持久会话，临时模式下放行但回复要先提示模式（临时会话不在列表里）。
 
+### 5. 多账号（bot 池）
+- **产品形态**：一个 bot 账号 = 扫码者本人的「AI 分身」，不能分享名片、不能多人共用，所以**多用户 = 多 bot 账号**，每人各自 `owux user add` 扫码。
+- **登录与运行分离**：
+  - 服务主循环**从不扫码**：零账号时打印提示并退出（exit 1）；有账号则为每账号各起一条长轮询任务。
+  - 扫码授权只存在于 `owux user add` 子命令（独立进程，一次一个，成功即退出）。
+- **热接管**：SQLite 即进程间总线（WAL + busy_timeout）。watcher 周期 `ACCOUNT_WATCH_INTERVAL` diff `weixin_session` 集合：新账号接入、token 变化则替换该账号运行实例、被删除的账号摘除。比对逻辑封装在 `Adapter._sync_accounts_once()`，便于脱离定时器测试。
+- **数据作用域划分（关键不变式）**：
+  - **bot 域（随账号走）**：`weixin_session`、`sync_buf:{account_id}`、`context_token(account_id, wechat_user_id)`，以及该账号自己的 `IlinkClient`/`TypingKeeper`/token。
+  - **人域（wxid 单键，跨账号存续）**：`binding`、`focus`、`temporary_chat`、`snapshot`、`pending_confirm`。依据：一个微信号同一时间只绑一个 bot（重复扫码解绑前绑），wxid⇄bot 实际 1:1；人级状态挂在 wxid 上，重扫/换 bot_id 都无需迁移。
+  - **MUST NOT**：在 `save_login` 里做任何跨账号的全局清空（旧实现清全局游标+全表 `context_token`，第二个用户扫码会毁掉第一个账号的路由）。副作用只允许作用于本次登录的 `account_id`。
+- **发送路由**：回复必须从**消息到达的那个账号**发出。`Adapter._user_account`（wxid→account_id）入站时维护，进程重启后由 `state.account_for_user(wxid)`（查 context_token 表最近更新行）兜底。`send_text(wechat_user_id, text)` 对外签名不变，内部自行解析账号；`UserRuntime.account_id` 记录回合所属账号，typing 也按该账号取。
+- **-14 会话过期（per-account）**：清该账号的 session 行与 context_token（`state.clear_account`），置空 handle token 使其轮询退出，日志提示 `owux user add` 重扫；**不再有全局 1 小时冷却**，其余账号不受影响。
+- **`owux user del <序号>`**：只删 bot 域（session 行 + 该账号 context_token + 游标），人域绑定保留——重加后同 wxid 无缝恢复。
+
 ---
 
 ## 关键模块说明
@@ -65,12 +84,15 @@
 - `open_webui_weixin/capabilities.py`：**翻译层核心**。
   - `Ref(id, name)`：封装引用，`.id` 用于请求体，`.label` 用于 `/status` 显示。
   - `resolve()`：核心纯函数，实现多层闸门逻辑。
+- `open_webui_weixin/adapter.py`：**多账号主循环**。`AccountHandle`（token + 自有 `IlinkClient` + `TypingKeeper` + 轮询 task）；`Adapter._accounts`/`_user_account` 维护账号池与 wxid→账号映射；`_poll_loop`（每账号一条）、`_watch_accounts`/`_sync_accounts_once`（热接管）、`_account_expired`（per-account 的 -14 处置）都在这一层。`self.client` 只服务扫码流程（`/relogin`），不参与收发。
 - `open_webui_weixin/chat.py`：回合执行逻辑，负责组装请求体并处理流式响应。
 - `open_webui_weixin/owui.py`：REST 客户端封装。
 - `open_webui_weixin/owui_socket.py`：Socket.io 处理器。
   - 必须响应 `request:terminal:state` 返回 `{connected: false}` 以干净剔除浏览器侧终端逻辑。
-- `open_webui_weixin/commands.py`：微信指令层（`/chat`, `/model`, `/status` 等）。
-- `open_webui_weixin/state.py`：数据库操作层。
+- `open_webui_weixin/commands.py`：微信指令层（`/chat`, `/model`, `/status` 等）。人域逻辑，与账号无关。
+- `open_webui_weixin/state.py`：数据库操作层。账号管理方法：`load_accounts`/`save_login`（per-account 副作用）/`clear_account`/`get_sync_buf`/`set_sync_buf`/`save_context_token`/`get_context_token`/`account_for_user`；`_migrate` 负责旧库升级（`context_token` 重建复合键、全局游标归户到唯一账号）。
+- `open_webui_weixin/main.py`：CLI 入口——服务模式（零账号提示退出）、`--check`（逐账号探测登录态）、`user add|list|del` 子命令（`LoginFlow` 复用扫码状态机）。
+- `open_webui_weixin/login.py`：扫码登录状态机 + ASCII 二维码（`user add` 与 `/relogin` 共用）。confirmed 后 `state.save_login` 落库；`local_token_list` 只是申请二维码时的报备字段，**不是账号配额**。
 - `open_webui_weixin/render.py`：OWUI 事件 → 微信消息序列的渲染状态机。
   - 分片优先按 Markdown 结构切：标题行前切（`#`/`##` 同档 → `###` … 逐级降级，无标题则不切）、真·分隔线（`---`/`***`/`___`，非 Setext 下划线、非表格分隔行）连同前文推出；长度上限仅作超限兜底（句子边界硬切）。围栏代码块（```` ``` ```` / `~~~` / `:::`）、`$$` 公式块、表格、列表整块保护，不允许在块内切点。
 
@@ -81,12 +103,13 @@
 - **Linting**：`ruff check` 必须全绿。行宽限制为 **110**。
 - **自动化测试**：
   - `tests/test_caps.py`：能力推导层逻辑测试（最重要的纯逻辑测试）。
-  - `tests/test_local.py`：使用 Mock OWUI 的本地交互流程测试。
+  - `tests/test_local.py`：使用 Mock OWUI 的本地交互流程测试；[4] 段覆盖多账号状态存储（游标/路由锚点的账号隔离、重扫只作废本账号、clear_account 边界）。
   - `tests/test_chat.py`：模拟 OWUI 真实响应的渲染测试。
   - `tests/test_temp.py`：临时聊天（本地存档、模式切换、请求体形状、命令确认流）。
-  - `tests/test_integration.py`：端到端连通性探测。
-- **自检命令**：`.venv/bin/owux --check`（按 `--dir` 解析工作目录，只探测链路，不发消息不改绑定）。
-- **服务运行**：通过 `./tests/run.sh` 启动 tmux 会话 `oc-owux`。日志位于工作目录 `data/adapter.log`。
+  - `tests/test_queue.py`：adapter 层队列/回合接线（手工装配 `AccountHandle`，不经 `run()`）。
+  - `tests/test_integration.py`：端到端连通性探测 + 多账号行为：per-account 的 -14 清理、watcher 热接管（新增/重授权/删除）用 `_sync_accounts_once` + spy 断言。
+- **自检命令**：`.venv/bin/owux --check`（按 `--dir` 解析工作目录，逐账号探测登录态，不发消息不改绑定）。
+- **服务运行**：通过 `./tests/run.sh` 启动 tmux 会话 `oc-owux`（脚本会 `cd` 到仓库根再找 `.venv/bin/owux`）。日志位于工作目录 `data/adapter.log`。
 
 ---
 
@@ -180,10 +203,19 @@
 - `/chat archive [序号]`：归档指定会话，无需确认。
 - `/chat rename <标题>`：重命名当前会话；支持 `/chat rename <序号> <标题>` 重命名指定历史会话。
 - `/yes` / `/no`：用于确认或取消上一条会话删除命令。
+- `/relogin`（隐藏维护命令）：在服务进程内重新走扫码状态机（等扫码期间会阻塞分发）。同微信号重扫通常恢复到同一 bot_id；若是别人扫的，则等价于新增一个账号，watcher 会自动接管。回执不得外露 bot_id。
+
+### 宿主机 CLI 账号命令（服务外使用）
+
+- `owux user add`：扫码添加/重新授权一个 bot 账号。二维码必须用**微信「设置 → 插件 → 微信 ClawBot」页面内的扫码入口**扫（普通扫一扫不认）。写库成功即退出；运行中的服务在 watcher 周期内自动接管。
+- `owux user list`：列出 `序号 / bot_id / 扫码者 wxid 短形式 / 授权时间 / OWUI 绑定`。协议拿不到微信昵称或微信号，**只能显示 wxid 与其 OWUI 绑定名**，不得伪造"昵称"。
+- `owux user del <序号>`：stdin 输入 y 确认后移除该账号的 bot 域数据（人域保留）。
+- **MUST**：账号管理逻辑放在 `main.py`，服务主循环不感知"添加"动作，只通过 diff 库收敛。
 
 ---
 
 ## 参考文档
+- **OWUI 后端接口实测笔记**：`docs/owui-backend-api.md`（面向任意第三方客户端复用本项目对 OWUI 的调研结论，含行号引用；供 Android/iOS 等项目直接投喂）
 - **Open WebUI 官方 API 说明**：[docs.openwebui.com API 接口文档](https://docs.openwebui.com/reference/api-endpoints/)
 - **本地 Swagger 调试**：在 OWUI 容器配置中注入环境参数 `ENV=dev` 即可访问 `http://localhost:8901/docs` 访问全部 OpenAPI (Swagger UI) 格式的详尽交互细节。
 - **OWUI 源码目录**：`/webservices/open-webui/source`

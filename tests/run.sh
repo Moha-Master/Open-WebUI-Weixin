@@ -6,7 +6,7 @@
 #   其余参数原样透传给 owux
 set -euo pipefail
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 SESSION=oc-owux
 BIN=.venv/bin/owux
 # 一切数据都落在工作目录（默认 ~/.config/open-webui-weixin/），代码目录保持只读。

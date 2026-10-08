@@ -56,7 +56,8 @@ class LoginFlow:
             img_content = str(data["qrcode_img_content"])
 
             print("\n" + "=" * 64, flush=True)
-            print(f"请使用微信扫描下方二维码完成机器人登录授权（第 {attempt} 张）", flush=True)
+            print("请在手机微信「设置 → 插件 → 微信 ClawBot」页面中按页面指引扫码", flush=True)
+            print(f"（第 {attempt} 张）", flush=True)
             print("=" * 64, flush=True)
             render_qr_to_terminal(img_content)
             print(f"\n二维码内容（打不开时可手动访问）：\n  {img_content}\n", flush=True)

@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import httpx
 
-from open_webui_weixin.adapter import Adapter
+from open_webui_weixin.adapter import AccountHandle, Adapter
 from open_webui_weixin.config import EXAMPLE_CONFIG_PATH, load_config
 from open_webui_weixin.owui import OwuiError, SessionInfo
 from open_webui_weixin.state import StateStore
@@ -33,6 +33,7 @@ from open_webui_weixin.weixin_protocol import IlinkClient
 FAILS: list[str] = []
 WX = "peer@im.wechat"
 CTX = "ctx-1"
+ACC = "test-bot@im.bot"
 
 
 def check(name: str, cond: bool, detail: Any = "") -> None:
@@ -142,7 +143,7 @@ class WeixinStub:
 
 async def build(
     tmp: Path, *, fail_socket: bool = False
-) -> tuple[Adapter, FakeOwui, WeixinStub, FakeSocket, StateStore]:
+) -> tuple[Adapter, FakeOwui, WeixinStub, FakeSocket, StateStore, AccountHandle]:
     cfg = load_config(EXAMPLE_CONFIG_PATH)
     cfg.state.path = str(tmp / "state.db")
     cfg.logging.to_file = False
@@ -160,7 +161,10 @@ async def build(
         transport=httpx.MockTransport(stub.handler),
     )
     adapter = Adapter(cfg, state, client, owui)
-    adapter._token = "tok"
+    # 直接构造账号运行时，绕过 run() 的扫码前置（单账号行为等价于旧单账号模式）
+    handle = AccountHandle(ACC, "tok", "https://fake.invalid", client)
+    adapter._accounts[ACC] = handle
+    adapter._user_account[WX] = ACC
 
     sock = FakeSocket()
     if fail_socket:
@@ -176,9 +180,9 @@ async def build(
         adapter.runtimes.ensure_socket = good_socket  # type: ignore[method-assign]
 
     state.upsert_binding(WX, {"email": "me@b.c", "password": "p", "jwt_token": "jwt", "jwt_expires_at": None})
-    state.save_context_token(WX, CTX)
+    state.save_context_token(ACC, WX, CTX)
     state.set_focus(WX, model_id="m-test")
-    return adapter, owui, stub, sock, state
+    return adapter, owui, stub, sock, state, handle
 
 
 async def settle(adapter: Adapter, timeout: float = 3.0) -> None:
@@ -194,9 +198,9 @@ async def settle(adapter: Adapter, timeout: float = 3.0) -> None:
 
 async def test_chat_roundtrip(tmp: Path) -> None:
     print("\n[1] 普通消息走聊天链路并分片回到微信")
-    adapter, owui, stub, sock, state = await build(tmp / "a")
+    adapter, owui, stub, sock, state, handle = await build(tmp / "a")
     try:
-        await adapter._dispatch(stub.msg("你好呀"))
+        await adapter._dispatch(handle, stub.msg("你好呀"))
         await settle(adapter)
         check("已发起 OWUI 生成", len(owui.sent_bodies) >= 1, owui.sent_bodies)
         body = owui.sent_bodies[0]
@@ -238,16 +242,16 @@ async def test_chat_roundtrip(tmp: Path) -> None:
 
 async def test_queue_merge(tmp: Path) -> None:
     print("\n[2] 生成中到达的消息排队，并在下一回合合并成一条")
-    adapter, owui, stub, sock, state = await build(tmp / "b")
+    adapter, owui, stub, sock, state, handle = await build(tmp / "b")
     try:
-        await adapter._dispatch(stub.msg("第一句"))
+        await adapter._dispatch(handle, stub.msg("第一句"))
         await asyncio.sleep(0.05)
         body1 = owui.sent_bodies[0]
         q1 = sock.queue_for(body1["id"])
 
         # 不结束第一回合，期间再发两条
-        await adapter._dispatch(stub.msg("第二句"))
-        await adapter._dispatch(stub.msg("第三句"))
+        await adapter._dispatch(handle, stub.msg("第二句"))
+        await adapter._dispatch(handle, stub.msg("第三句"))
         rt = adapter.runtimes.get(WX)
         check("两条新消息被暂存", len(rt.pending) == 2, rt.pending)
         notice = [s for s in stub.sent if "排队" in s or "队列" in s]
@@ -272,12 +276,12 @@ async def test_queue_limit(tmp: Path) -> None:
     print("\n[3] 排队超限给出提示而不是无限堆积")
     from open_webui_weixin.runtime import PENDING_LIMIT
 
-    adapter, _owui, stub, _sock, state = await build(tmp / "c")
+    adapter, _owui, stub, _sock, state, handle = await build(tmp / "c")
     try:
-        await adapter._dispatch(stub.msg("占位第一句"))
+        await adapter._dispatch(handle, stub.msg("占位第一句"))
         await asyncio.sleep(0.05)
         for i in range(PENDING_LIMIT + 2):
-            await adapter._dispatch(stub.msg(f"追加{i}"))
+            await adapter._dispatch(handle, stub.msg(f"追加{i}"))
         rt = adapter.runtimes.get(WX)
         check("队列不超上限", len(rt.pending) <= PENDING_LIMIT, len(rt.pending))
         check("超限时告知用户", any("排队" in s or "清空" in s for s in stub.sent), stub.sent[-3:])
@@ -288,12 +292,12 @@ async def test_queue_limit(tmp: Path) -> None:
 
 async def test_stop(tmp: Path) -> None:
     print("\n[4] /stop 清队列并请求 OWUI 停止当前会话")
-    adapter, owui, stub, _sock, state = await build(tmp / "d")
+    adapter, owui, stub, _sock, state, handle = await build(tmp / "d")
     try:
-        await adapter._dispatch(stub.msg("要被打断的一句"))
+        await adapter._dispatch(handle, stub.msg("要被打断的一句"))
         await asyncio.sleep(0.05)
         state.set_focus(WX, chat_id="chat-running", leaf_id="prev", model_id="m-test", is_first_message=False)
-        await adapter._dispatch(stub.msg("/stop"))
+        await adapter._dispatch(handle, stub.msg("/stop"))
         await settle(adapter)
         check("调用了 OWUI 停止接口", owui.stop_calls == ["chat-running"], owui.stop_calls)
         rt = adapter.runtimes.get(WX)
@@ -308,9 +312,9 @@ async def test_stop(tmp: Path) -> None:
 
 async def test_socket_failure(tmp: Path) -> None:
     print("\n[5] socket 建不起来时必须给用户可读错误，不能卡住")
-    adapter, owui, stub, _sock, state = await build(tmp / "e", fail_socket=True)
+    adapter, owui, stub, _sock, state, handle = await build(tmp / "e", fail_socket=True)
     try:
-        await adapter._dispatch(stub.msg("你好"))
+        await adapter._dispatch(handle, stub.msg("你好"))
         await settle(adapter, timeout=2.0)
         check("未发起生成（连接失败即返回）", owui.sent_bodies == [], len(owui.sent_bodies))
         check("给出错误提示", any("实时通道" in s for s in stub.sent), stub.sent)

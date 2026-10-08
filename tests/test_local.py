@@ -343,29 +343,58 @@ async def main() -> None:
     except Exception:
         check("非零 ret 抛错", True)
 
-    print("\n[4] 状态存储：登录态与 context_token")
+    print("\n[4] 状态存储：多账号登录态与 context_token")
     st = tmp_state(tmp)
     check("初始无 session", st.load_session() is None)
-    check("初始 sync_buf 为空", st.sync_buf == "")
-    login_result = {
+    login_a = {
         "bot_token": "t1",
-        "bot_id": "bot@im.bot",
+        "bot_id": "bot-a@im.bot",
         "base_url": "https://api",
-        "scanner_user_id": "s1",
+        "scanner_user_id": "s1@im.wechat",
     }
-    st.save_login(login_result)
+    st.save_login(login_a)
     row = st.load_session()
     check("登录态已存", row is not None and row["bot_token"] == "t1")
-    check("bot_id 已存", row["account_id"] == "bot@im.bot")
-    st.sync_buf = "cursor-abc"
-    check("sync_buf 持久化", st.sync_buf == "cursor-abc")
-    st.save_context_token("u_a@im.wechat", "ctx-1")
-    check("context_token 持久化", st.get_context_token("u_a@im.wechat") == "ctx-1")
-    check("未知用户无 context_token", st.get_context_token("nobody") == "")
-    st.save_login({**login_result, "bot_token": "t2"})
-    check("重新登录后游标清空", st.sync_buf == "")
-    check("重新登录后 context_token 作废", st.get_context_token("u_a@im.wechat") == "")
+    check("bot_id 已存", row["account_id"] == "bot-a@im.bot")
+    check("初始游标为空", st.get_sync_buf("bot-a@im.bot") == "")
+    st.set_sync_buf("bot-a@im.bot", "cursor-abc")
+    check("游标按账号持久化", st.get_sync_buf("bot-a@im.bot") == "cursor-abc")
+    st.save_context_token("bot-a@im.bot", "u_a@im.wechat", "ctx-1")
+    check("context_token 持久化", st.get_context_token("bot-a@im.bot", "u_a@im.wechat") == "ctx-1")
+    check("未知用户无 context_token", st.get_context_token("bot-a@im.bot", "nobody") == "")
+    check("wxid 可反查所属账号", st.account_for_user("u_a@im.wechat") == "bot-a@im.bot")
+
+    # 重新授权同一账号：只作废该账号自己的游标与路由锚点
+    st.save_login({**login_a, "bot_token": "t2"})
+    check("重新登录后该账号游标清空", st.get_sync_buf("bot-a@im.bot") == "")
+    check("重新登录后该账号 context_token 作废", st.get_context_token("bot-a@im.bot", "u_a@im.wechat") == "")
     check("known_tokens 累积", "t1" in st.known_bot_tokens() and "t2" in st.known_bot_tokens())
+
+    # 第二个账号扫码：不得影响第一个账号的任何数据
+    st.set_sync_buf("bot-a@im.bot", "cursor-xyz")
+    st.save_context_token("bot-a@im.bot", "u_a@im.wechat", "ctx-1b")
+    st.save_login(
+        {"bot_token": "t3", "bot_id": "bot-b@im.bot", "base_url": "https://api2", "scanner_user_id": "s2"}
+    )
+    check(
+        "第二个账号已入库",
+        [r["account_id"] for r in st.load_accounts()] == ["bot-a@im.bot", "bot-b@im.bot"],
+    )
+    check("B 登录不清 A 的游标", st.get_sync_buf("bot-a@im.bot") == "cursor-xyz")
+    check(
+        "B 登录不影响 A 的 context_token",
+        st.get_context_token("bot-a@im.bot", "u_a@im.wechat") == "ctx-1b",
+    )
+    st.save_context_token("bot-b@im.bot", "u_b@im.wechat", "ctx-b")
+    check("B 的 context_token 独立", st.get_context_token("bot-b@im.bot", "u_b@im.wechat") == "ctx-b")
+    check("known_tokens 继续累积", "t3" in st.known_bot_tokens())
+    check("load_session 取最近授权账号", st.load_session()["account_id"] == "bot-b@im.bot")
+
+    # 移除账号 B：A 完全不受影响；绑定（人级状态）保留
+    st.clear_account("bot-b@im.bot")
+    check("移除后账号列表只剩 A", [r["account_id"] for r in st.load_accounts()] == ["bot-a@im.bot"])
+    check("移除账号连带清其 context_token", st.get_context_token("bot-b@im.bot", "u_b@im.wechat") == "")
+    check("A 的 context_token 仍在", st.get_context_token("bot-a@im.bot", "u_a@im.wechat") == "ctx-1b")
     st.close()
 
     print("\n[5] 命令：/help 与未绑定提示")

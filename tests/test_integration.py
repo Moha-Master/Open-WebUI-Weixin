@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import httpx
 
-from open_webui_weixin.adapter import Adapter
+from open_webui_weixin.adapter import AccountHandle, Adapter
 from open_webui_weixin.config import EXAMPLE_CONFIG_PATH, load_config
 from open_webui_weixin.owui import OwuiError, SessionInfo
 from open_webui_weixin.state import StateStore
@@ -28,6 +28,7 @@ from open_webui_weixin.weixin_protocol import IlinkClient
 FAILS: list[str] = []
 WX_USER = "peer_openid@im.wechat"
 BOT_TOKEN = "test-bot-token"
+ACC = "bot@im.bot"
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -158,19 +159,23 @@ def make_adapter(tmp: Path, server: FakeWeixinServer) -> tuple[Adapter, StateSto
         }
     )
     adapter = Adapter(cfg, state, client, FakeOwui())
-    adapter._token = BOT_TOKEN
+    # 手工装配账号运行时（不启动服务主循环的常驻 poller）
+    handle = AccountHandle("bot@im.bot", BOT_TOKEN, "https://fake.weixin.invalid", client)
+    adapter._accounts[handle.account_id] = handle
+    adapter._user_account[WX_USER] = handle.account_id
     return adapter, state, client
 
 
 async def drive(adapter: Adapter, rounds: int) -> None:
-    """跑固定轮数而不是常驻，便于断言。"""
+    """跑固定轮数而不是常驻，便于断言（单账号场景等价于服务主循环）。"""
+    handle = adapter._accounts[ACC]
     for _ in range(rounds):
-        data = await adapter.client.get_updates(adapter._token, adapter.state.sync_buf)
+        data = await adapter.client.get_updates(handle.token, adapter.state.get_sync_buf(ACC))
         buf = data.get("get_updates_buf")
         if buf:
-            adapter.state.sync_buf = buf
+            adapter.state.set_sync_buf(ACC, buf)
         for msg in data.get("msgs") or []:
-            await adapter._dispatch(msg)
+            await adapter._dispatch(handle, msg)
 
 
 async def main() -> None:
@@ -192,7 +197,7 @@ async def main() -> None:
     server.pending_inbound = [server.make_msg("你好")]
     await drive(adapter, 1)
     check("处理了 1 条入站", len(server.sent) == 1, str(len(server.sent)))
-    check("context_token 已捕获", state.get_context_token(WX_USER) == "ctx-live-1")
+    check("context_token 已捕获", state.get_context_token(ACC, WX_USER) == "ctx-live-1")
     body = server.sent[0]
     check("回复含绑定引导", "尚未绑定" in sent_json(0), sent_json(0)[:200])
 
@@ -248,7 +253,7 @@ async def main() -> None:
     await drive(adapter, 1)
     no_send = len(server.sent) == before_other
     check("无 context_token 时完全不发出站请求", no_send, f"{before_other} -> {len(server.sent)}")
-    check("该用户没有可用的 context_token", state.get_context_token(other) == "")
+    check("该用户没有可用的 context_token", state.get_context_token(ACC, other) == "")
 
     print("\n[9] 超长回复自动分片")
     long_text = "。".join(["片段内容" * 30] * 60)
@@ -263,22 +268,25 @@ async def main() -> None:
     ids = [m["msg"]["client_id"] for m in new_sends]
     check("每片 client_id 唯一", len(set(ids)) == len(ids))
 
-    print("\n[10] -14 会话过期 -> 清理登录态并进入冷却")
+    print("\n[10] -14 会话过期 -> 只清理该账号（其余账号不受影响）")
     expired_server = FakeWeixinServer()
     expired_server.force_expired_at = 1
     a2, st2, c2 = make_adapter(tmp / "exp", expired_server)
-    await a2.handle_session_expired()
+    h2 = a2._accounts[ACC]
+    st2.save_context_token(ACC, WX_USER, "ctx-before-exp")
+    await a2._account_expired(h2)
     check("登录态已清空", st2.load_session() is None)
-    check("游标已清空", st2.sync_buf == "")
-    check("token 已置空", a2._token == "")
-    check("进入冷却", a2._session_expired_at > 0)
+    check("该账号游标已清空", st2.get_sync_buf(ACC) == "")
+    check("该账号 context_token 已清", st2.get_context_token(ACC, WX_USER) == "")
+    check("token 已置空", h2.token == "")
+    await c2.close()
+    st2.close()
     await c2.close()
     st2.close()
 
     print("\n[11] JWT 到期提醒不得刷屏（每 12 小时最多一次）")
     hint_srv = FakeWeixinServer()
     hint_ad, hint_st, hint_cl = make_adapter(tmp / "hint", hint_srv)
-    hint_ad._token = BOT_TOKEN
     # 绑定一个 1 天后到期的 JWT（落在 3 天提醒窗口内）
     hint_st.upsert_binding(
         WX_USER,
@@ -305,6 +313,53 @@ async def main() -> None:
     check("重置提醒戳后可再提醒", len(hinted2) == 2, str(len(hinted2)))
     await hint_cl.close()
     hint_st.close()
+
+    print("\n[12] 账号热加载：新增/重授权/移除无需重启")
+    hot_srv = FakeWeixinServer()
+    a3, st3, c3 = make_adapter(tmp / "hot", hot_srv)
+    started: list[str] = []
+    stopped: list[str] = []
+
+    def spy_start(row):
+        # 不真起长轮询（那会创建真实 HTTP 客户端），只登记接入行为
+        h = AccountHandle(row["account_id"], row["bot_token"], row["base_url"] or "", c3, None)
+        a3._accounts[h.account_id] = h
+        started.append(h.account_id)
+        return h
+
+    async def spy_stop(account_id: str) -> None:
+        stopped.append(account_id)
+        a3._accounts.pop(account_id, None)
+
+    a3._start_account = spy_start  # type: ignore[method-assign]
+    a3._stop_account = spy_stop  # type: ignore[method-assign]
+    try:
+        a3._accounts.clear()  # make_adapter 预装过存量账号，这里验证 watcher 自己的接入
+        await a3._sync_accounts_once()
+        check("存量账号自动接入", started == [ACC] and ACC in a3._accounts)
+
+        login_b = {
+            "bot_token": "tok-b",
+            "bot_id": "bot-b@im.bot",
+            "base_url": "https://fake.weixin.invalid",
+            "scanner_user_id": "s2",
+        }
+        st3.save_login(login_b)
+        await a3._sync_accounts_once()
+        check("服务运行中新账号被热加载", started == [ACC, "bot-b@im.bot"], str(started))
+
+        st3.save_login({**login_b, "bot_token": "tok-b2"})
+        await a3._sync_accounts_once()
+        check("重授权后切换到新凭据", a3._accounts["bot-b@im.bot"].token == "tok-b2", started)
+        check("重授权会替换旧运行实例", "bot-b@im.bot" in stopped, stopped)
+
+        st3.clear_account("bot-b@im.bot")
+        await a3._sync_accounts_once()
+        check("被删除的账号被摘除", "bot-b@im.bot" not in a3._accounts)
+        check("存量账号不受影响", ACC in a3._accounts and ACC not in stopped)
+    finally:
+        await c3.close()
+        st3.close()
 
     await client.close()
     state.close()

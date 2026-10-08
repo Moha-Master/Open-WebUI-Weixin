@@ -283,10 +283,14 @@ class CommandHandler:
         if self.login_flow is None:
             return "当前实例不支持重扫"
         try:
-            result = await self.login_flow.run()
+            await self.login_flow.run()
         except Exception as exc:
             return f"重新扫码失败：{exc}"
-        return f"微信登录已更新：bot_id={result['bot_id']}"
+        return (
+            "微信授权已更新。\n"
+            "服务会在数十秒内自动切换到新凭据；若扫码的是新的微信号，"
+            "则相当于新增了一个机器人账号，同样自动接管。"
+        )
 
     def _reset_hint(self, wechat_user_id: str) -> None:
         """绑定/刷新成功后清掉到期提醒戳。"""
