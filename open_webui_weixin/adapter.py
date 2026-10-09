@@ -292,7 +292,7 @@ class Adapter:
                 reply = await self.commands.handle(wechat_user_id, text)
             except Exception:
                 log.exception("命令处理异常")
-                reply = "处理你的消息时出错了，请稍后重试。"
+                reply = "❌ 处理你的消息时出错了，请稍后重试。"
             if reply:
                 await self.send_text(wechat_user_id, reply)
         else:
@@ -305,14 +305,16 @@ class Adapter:
         binding = self.state.get_binding(wechat_user_id)
         if binding is None:
             await self.send_text(
-                wechat_user_id, "尚未绑定 Open WebUI 账号。\n\n用 /login <邮箱> <密码> 绑定。"
+                wechat_user_id, "尚未绑定 Open WebUI 账号。\n\n用 `/login <邮箱> <密码>` 绑定。"
             )
             return
 
         rt = self.runtimes.get(wechat_user_id)
         rt.account_id = self._account_id_for(wechat_user_id)
         if len(rt.pending) >= PENDING_LIMIT:
-            await self.send_text(wechat_user_id, f"前面已排队 {len(rt.pending)} 条，发送 /stop 可清空重来。")
+            await self.send_text(
+                wechat_user_id, f"前面已排队 {len(rt.pending)} 条，发送 `/stop` 可清空重来。"
+            )
             return
         rt.pending.append(text)
 
@@ -337,7 +339,7 @@ class Adapter:
                 socket = await self.runtimes.ensure_socket(wechat_user_id, jwt_token)
             except Exception:
                 log.exception("建立 OWUI 实时通道失败")
-                await self.send_text(wechat_user_id, "连不上 Open WebUI 的实时通道，稍后重试。")
+                await self.send_text(wechat_user_id, "❌ 连不上 Open WebUI 的实时通道，稍后重试。")
                 rt.pending.clear()
                 break
 
@@ -353,14 +355,14 @@ class Adapter:
                 except Exception:
                     log.exception("生成回合异常")
                     await self._typing_stop(rt.account_id, wechat_user_id)
-                    await self.send_text(wechat_user_id, "生成时发生内部错误，请稍后重试。")
+                    await self.send_text(wechat_user_id, "❌ 生成时发生内部错误，请稍后重试。")
                     continue
             await self._typing_stop(rt.account_id, wechat_user_id)
 
             if result.error:
                 await self.send_text(wechat_user_id, f"❌ {result.error}")
             if result.sent_segments == 0 and not result.error:
-                await self.send_text(wechat_user_id, "（本轮没有可显示的文本回复）")
+                await self.send_text(wechat_user_id, "> 本轮没有可显示的文本回复")
             log.info(
                 "回合结束 chat=%s 分片=%d 说明=%d%s",
                 (result.chat_id or "-")[:8],
@@ -409,8 +411,8 @@ class Adapter:
             return "当前没有正在进行的生成。"
         suffix = f"（同时清掉了 {queued} 条排队消息）" if queued else ""
         if stopped_remote:
-            return f"已请求 Open WebUI 停止生成{suffix}。"
-        return f"已中断本地等待{suffix}。远端生成可能仍在继续，可在网页端查看。"
+            return f"**已请求 Open WebUI 停止生成**{suffix}。"
+        return f"**已中断本地等待**{suffix}。远端生成可能仍在继续，可在网页端查看。"
 
     async def _maybe_hint_jwt_expiry(self, wechat_user_id: str) -> None:
         """JWT 临近到期时提醒，但每 12 小时最多一次，避免刷屏。"""
@@ -427,7 +429,8 @@ class Adapter:
         self.state.set_meta(key, str(int(_now())))
         await self.send_text(
             wechat_user_id,
-            f"提醒：你的 Open WebUI JWT 将在 {remain / 86400:.1f} 天后过期，可发送 /login-refresh 刷新。",
+            f"> 提醒：你的 Open WebUI 登录令牌将在 {remain / 86400:.1f} 天后过期，"
+            f"可发送 `/login-refresh` 刷新。",
         )
 
     # ---------- 出站 ----------

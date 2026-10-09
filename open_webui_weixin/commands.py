@@ -26,45 +26,58 @@ from . import capabilities
 from .capabilities import RequestCaps
 from .config import AppConfig
 from .login import LoginFlow
+from .md import code_span
 from .owui import OwuiClient, OwuiError
 from .state import StateStore
 
 log = logging.getLogger(__name__)
 
 HELP_TEXT = """\
-Open WebUI 微信适配器
+# Open WebUI 微信适配器
 
-账号
-/login <邮箱> <密码>   绑定 Open WebUI 账号
-/login-refresh         重新登录以换取新令牌
-/logout                解除绑定
-/status                查看绑定与当前会话
+## 使用方式
+在聊天窗口中输入斜杠开头的命令，然后将其发送。
 
-对话
-/chat new              新建会话（首条消息发出后才真正创建）
-/chat temp             临时聊天：不进 Open WebUI 历史，仅存微信适配器本地；
-                       再次执行=清空记录重新开始
-/chat list [n]         列出最近 n 条会话，默认 5，最多 20
-/chat attach <序号>    切换到某个会话，同时改用它历史用过的模型
-/chat del [序号]       删除会话（需 /yes 确认；省略序号=当前会话）
-/chat archive [序号]   归档会话（可在网页端找回，无需确认）
-/chat rename <标题>    重命名当前会话；也可 /chat rename <序号> <标题>
+## 账号管理
+| 命令 | 说明 |
+| --- | --- |
+| `/login <邮箱> <密码>` | 绑定 Open WebUI 账号 |
+| `/login-refresh` | 重新登录以换取新令牌 |
+| `/logout` | 解除当前账号绑定 |
+| `/status` | 查看绑定与当前会话状态 |
 
-模型
-/model list            列出可用模型
-/model use <序号>      选用模型
-                       未选模型时自动选用：你的偏好 → 默认模型 → 第一个可用
+## 对话管理
+| 命令 | 说明 |
+| --- | --- |
+| `/chat new` | 新建会话（首条消息发出后创建） |
+| `/chat temp` | 开启/重置临时聊天（不写 OWUI） |
+| `/chat list [n]` | 列出最近会话（默认 5，最多 20） |
+| `/chat attach <序号>` | 切换到指定会话及历史模型 |
+| `/chat del [序号]` | 删除会话（需 `/yes` 确认） |
+| `/chat archive [序号]` | 归档指定会话（可在网页端找回） |
+| `/chat rename <标题>` | 重命名当前或指定会话 |
 
-其它
-/stop                  打断当前生成并清空排队消息
-/yes  /no              确认 / 取消上一步危险操作
-/help                  本帮助
+## 模型管理
+| 命令 | 说明 |
+| --- | --- |
+| `/model list` | 列出所有可用模型 |
+| `/model use <序号>` | 切换当前使用的模型 |
+
+> 未指定时按以下规则自动选取：
+> 账号默认模型 → 管理员默认设置 → 首个可用模型
+
+## 其它指令
+| 命令 | 说明 |
+| --- | --- |
+| `/stop` | 打断当前生成并清空排队消息 |
+| `/yes` / `/no` | 确认 / 取消危险操作 |
+| `/help` | 查看本帮助说明 |
 """
 
-USAGE_ERROR = "用法有误，输入 /help 查看命令表"
+USAGE_ERROR = "用法有误。\n> `/help` 查看帮助。"
 
 # 临时聊天模式下执行持久会话操作的统一提示（临时会话不进 OWUI，自然不在列表里）
-TEMP_NOTICE = "（当前处于临时聊天：此操作针对持久会话，临时会话不出现在会话列表中）"
+TEMP_NOTICE = "> 当前处于临时聊天，此操作仅对持久会话有效！"
 
 
 @dataclass
@@ -127,25 +140,25 @@ class CommandHandler:
         if name == "/chat":
             return await self._chat(wechat_user_id, args)
 
-        return f"未知命令 {name}\n\n输入 /help 查看命令表"
+        return f"未知命令 `{name}`。\n\n> `/help` 查看帮助"
 
     def _non_command(self, wechat_user_id: str) -> str:
         """非命令文本：未绑定则引导；已绑定的聊天由 adapter 直接处理，不走这里。"""
         if self.state.get_binding(wechat_user_id) is None:
-            return "尚未绑定 Open WebUI 账号。\n\n用 /login <邮箱> <密码> 绑定，或 /help 查看命令。"
+            return "尚未绑定 Open WebUI 账号。\n\n> `/login <邮箱> <密码>` 绑定\n> `/help` 查看帮助"
         return ""
 
     # ---------- 账号 ----------
 
     async def _login(self, wechat_user_id: str, args: list[str]) -> str:
         if len(args) < 2:
-            return "用法：/login <邮箱> <密码>"
+            return "用法：`/login <邮箱> <密码>`。"
         email, password = args[0], args[1]
         try:
             session = await self.owui.signin(email, password)
         except OwuiError as exc:
             if exc.status_code in (400, 401, 403):
-                return "绑定失败：Open WebUI 拒绝了这组凭据"
+                return "绑定失败：请检查账号密码是否正确输入。"
             return f"绑定失败：{exc}"
 
         self.state.upsert_binding(
@@ -164,11 +177,8 @@ class CommandHandler:
         await self.ctx.on_binding_changed(wechat_user_id)
 
         default_model = await self._maybe_default_model(wechat_user_id)
-        return (
-            f"已绑定：{session.name or session.email}（{session.role}）\n"
-            f"登录令牌：{_fmt_remaining(session.expires_at)}\n"
-            f"{default_model}"
-        )
+        who = session.name or session.email
+        return f"## 绑定成功\nOWUI用户：{who}\n角色：{session.role}\n\n{default_model}"
 
     async def _maybe_default_model(self, wechat_user_id: str) -> str:
         """绑定后按 WebUI 同款优先级定一个模型，省掉一步 /model use。"""
@@ -180,20 +190,21 @@ class CommandHandler:
         except OwuiError:
             return ""
         if resolved is None:
-            return "当前账号没有可用模型，请在网页端确认模型权限。"
+            return "## 使用模型\n当前账号没有可用模型，请向管理员确认模型权限。"
         model_id, name = resolved
         self.state.set_focus(wechat_user_id, model_id=model_id)
         caps = await self._caps_for(binding["jwt_token"], model_id)
-        cap_line = f"\n能力：{caps.summary()}" if caps else ""
-        return (
-            f"已自动选用模型：{name}{cap_line}\n"
-            f"（用 /model list 查看其它，/model use <序号> 切换）"
-        )
+
+        sections = [f"## 使用模型\n{name}"]
+        if caps:
+            sections.extend(caps.format_sections())
+        sections.append("> 已自动选取默认模型。\n> `/model list` 查看模型列表\n> `/model use <序号>` 切换模型")
+        return "\n\n".join(sections)
 
     async def _login_refresh(self, wechat_user_id: str) -> str:
         binding = self.state.get_binding(wechat_user_id)
         if binding is None:
-            return "尚未绑定账号，请先执行 /login <邮箱> <密码>"
+            return "尚未绑定账号。\n`/login <邮箱> <密码>` 绑定账号"
         try:
             session = await self.owui.signin(binding["owui_email"], binding["owui_password"])
         except OwuiError as exc:
@@ -212,7 +223,7 @@ class CommandHandler:
         )
         self._reset_hint(wechat_user_id)
         await self.ctx.on_binding_changed(wechat_user_id)
-        return f"登录令牌已刷新：{_fmt_remaining(session.expires_at)}"
+        return f"## 登录令牌已刷新\n{_fmt_remaining(session.expires_at)}"
 
     async def _logout(self, wechat_user_id: str) -> str:
         if self.state.delete_binding(wechat_user_id):
@@ -226,70 +237,71 @@ class CommandHandler:
             )
             self.state.temporary_drop(wechat_user_id)
             await self.ctx.on_binding_changed(wechat_user_id)
-            return "已解除绑定。重新绑定请用 /login <邮箱> <密码>"
-        return "当前微信账号并未绑定任何 Open WebUI 账号"
+            return "已解除绑定。\n> `/login <邮箱> <密码>` 再次绑定"
+        return "当前微信账号并未绑定任何 Open WebUI 账号。"
 
     async def _status(self, wechat_user_id: str) -> str:
         binding = self.state.get_binding(wechat_user_id)
-        focus = self.state.get_focus(wechat_user_id)
-        lines: list[str] = []
         if binding is None:
-            lines += ["Open WebUI：未绑定", "", "用 /login <邮箱> <密码> 绑定。"]
-            return "\n".join(lines)
+            return "## OWUI用户\n未绑定\n\n> `/login <邮箱> <密码>` 进行绑定。"
 
-        expires_at = binding["jwt_expires_at"]
-        lines += [
-            f"Open WebUI：{binding['owui_name'] or '-'} <{binding['owui_email']}>",
-            f"登录令牌：{_fmt_remaining(expires_at)}",
-        ]
+        username = binding["owui_name"] or binding["owui_email"] or "-"
+        focus = self.state.get_focus(wechat_user_id)
+        sections: list[str] = [f"## OWUI用户\n{username}"]
+
         if focus is not None and focus["temporary"]:
-            history = self.state.temporary_history(wechat_user_id)
-            rounds = sum(1 for m in history if m.get("role") == "user")
-            lines.append(f"当前会话：临时聊天（已 {rounds} 轮，内容不进 Open WebUI）")
+            chat_status = "临时聊天"
         elif focus is None or not focus["chat_id"]:
-            lines.append("当前会话：未建立（下一条消息将新建会话）")
+            chat_status = "空闲中，发送消息以新建会话"
         else:
-            marker = "（首条消息待发送）" if focus["is_first_message"] else ""
-            lines.append(f"当前会话：{focus['chat_title'] or '（无标题）'}{marker}")
+            marker = "（待发送消息）" if focus["is_first_message"] else ""
+            chat_status = f"{focus['chat_title'] or '（无标题）'}{marker}"
+        sections.append(f"## 当前会话\n{chat_status}")
+
         model_id = str(focus["model_id"] or "") if focus else ""
         if not model_id:
-            lines.append("模型：未选择（下条消息自动选用）")
-            return "\n".join(lines)
+            sections.append("## 使用模型\n未选择，发送消息时将自动选用。")
+            return "\n\n".join(sections)
 
         labels = await self._model_map(binding["jwt_token"])
         name = (labels or {}).get(model_id)
         if name:
-            lines.append(f"模型：{name}")
+            model_status = name
         elif labels is None:
-            lines.append("模型：未知（读取模型列表失败）")
+            model_status = "读取模型列表失败。"
         else:
-            lines.append("模型：未知（该模型已不在可用列表中）")
+            model_status = "该模型已不在可用列表中。"
+        sections.append(f"## 使用模型\n{model_status}")
 
         caps = await self._caps_for(binding["jwt_token"], model_id)
-        lines.append(f"能力：{caps.summary()}" if caps else "能力：暂时读不到（Open WebUI 不可达）")
-        return "\n".join(lines)
+        if caps:
+            sections.extend(caps.format_sections())
+        else:
+            sections.append("## 模型能力\n未能获取")
+
+        return "\n\n".join(sections)
 
     async def _whoami(self, wechat_user_id: str) -> str:
         binding = self.state.get_binding(wechat_user_id)
         if binding is None:
-            return "尚未绑定账号"
+            return "尚未绑定账号。"
         try:
             session = await self.owui.whoami(binding["jwt_token"])
         except OwuiError:
-            return "登录令牌已失效，请发 /login-refresh 重新绑定"
-        return f"登录令牌有效\n用户：{session.name} <{session.email}>\n角色：{session.role}"
+            return "登录令牌已失效。\n> `/login-refresh` 刷新登陆"
+        return f"登录令牌有效。\n**用户**：{session.name}\n**角色**：`{session.role}`"
 
     async def _relogin(self, wechat_user_id: str) -> str:
         if self.login_flow is None:
-            return "当前实例不支持重扫"
+            return "当前实例不支持重新扫码。"
         try:
             await self.login_flow.run()
         except Exception as exc:
             return f"重新扫码失败：{exc}"
         return (
-            "微信授权已更新。\n"
-            "服务会在数十秒内自动切换到新凭据；若扫码的是新的微信号，"
-            "则相当于新增了一个机器人账号，同样自动接管。"
+            "## 微信授权已更新\n"
+            "服务即将自动切换到新凭据；若扫码的是新的微信号，"
+            "则相当于新增了一个 bot 账号。"
         )
 
     def _reset_hint(self, wechat_user_id: str) -> None:
@@ -301,7 +313,7 @@ class CommandHandler:
     async def _confirm(self, wechat_user_id: str) -> str:
         pending = self.state.take_pending(wechat_user_id)
         if pending is None:
-            return "没有待确认的操作（或已超时）"
+            return "没有待确认的操作或已超时。"
         action, payload = pending
         if action == "chat_delete":
             data = json.loads(payload)
@@ -310,23 +322,23 @@ class CommandHandler:
             )
         if action == "temp_exit_new":
             notice = self._leave_temporary(wechat_user_id)
-            return f"{notice}\n{self._chat_new(wechat_user_id)}"
+            return f"{notice}\n\n{self._chat_new(wechat_user_id)}"
         if action == "temp_exit_chat_attach":
             data = json.loads(payload)
             notice = self._leave_temporary(wechat_user_id)
-            return f"{notice}\n{await self._do_attach(wechat_user_id, data.get('args') or [])}"
-        return "未知的待确认操作"
+            return f"{notice}\n\n{await self._do_attach(wechat_user_id, data.get('args') or [])}"
+        return "未知的待确认操作。"
 
     async def _cancel(self, wechat_user_id: str) -> str:
         if self.state.take_pending(wechat_user_id) is None:
-            return "没有待确认的操作"
+            return "没有待确认的操作或已超时。"
         return "已取消"
 
     def _leave_temporary(self, wechat_user_id: str) -> str:
         """退出临时聊天：清掉模式标记并丢弃本地记录；持久焦点断点不受影响。"""
         self.state.set_focus(wechat_user_id, temporary=0)
         self.state.temporary_drop(wechat_user_id)
-        return "已退出临时聊天（本地临时记录已清空）。"
+        return "**已退出临时聊天。**"
 
     # ---------- 模型 ----------
 
@@ -336,30 +348,33 @@ class CommandHandler:
             return await self._model_list(wechat_user_id)
         if sub == "use":
             if len(args) < 2 or not args[1].isdigit():
-                return "用法：/model use <序号>（序号来自 /model list）"
+                return "用法：`/model use <序号>。`\n> `/model list` 查看序号"
             return await self._model_use(wechat_user_id, int(args[1]))
         return USAGE_ERROR
 
     async def _model_list(self, wechat_user_id: str) -> str:
         binding = self.state.get_binding(wechat_user_id)
         if binding is None:
-            return "请先 /login 绑定账号"
+            return "请先 `/login` 绑定账号。"
         available = await self._model_map(binding["jwt_token"], skip_hidden=True)
         if available is None:
-            return "获取模型失败，请稍后重试；持续失败请发 /login-refresh"
+            return "获取模型失败，请稍后重试。"
         if not available:
-            return "该账号在 Open WebUI 里没有可用模型"
+            return "该账号在 Open WebUI 里没有可用模型。"
 
         focus = self.state.get_focus(wechat_user_id)
         current = str(focus["model_id"] or "") if focus else ""
         items = list(available.items())
         self.state.save_snapshot(wechat_user_id, "models", items)
-        lines = [f"可用模型（共 {len(items)} 个，用 /model use <序号> 选择）："]
+
+        lines = ["## 可用模型"]
         for i, (mid, name) in enumerate(items, start=1):
-            mark = " ←当前" if mid == current else ""
-            lines.append(f"{i}. {name}{mark}")
+            if mid == current:
+                lines.append(f"{i}. **{name}**")
+            else:
+                lines.append(f"{i}. {name}")
         if current and current not in available:
-            lines.append("（当前选用的模型不在可用列表中，/model use 可改选）")
+            lines.append("\n> 当前选用的模型不在可用列表中。\n> `/model list` 查看可用模型\n> `/model use <序号>` 更换可用模型")
         return "\n".join(lines)
 
     async def _model_map(self, jwt_token: str, *, skip_hidden: bool = False) -> dict[str, str] | None:
@@ -404,29 +419,37 @@ class CommandHandler:
         if resolved is None:
             size = self.state.snapshot_size(wechat_user_id, "models")
             if size == 0:
-                return "还没列出过模型，请先 /model list"
+                return "请先 `/model list` 刷新模型列表。"
             if idx > size:
-                return f"序号超出范围（上一次列表只有 {size} 个，请重新 /model list）"
-            return "序号无效，请重新 /model list"
+                return f"模型列表发生变动，请重新 `/model list`。"
+            return "序号无效，请重新 `/model list`。"
         model_id, _label = resolved
 
         binding = self.state.get_binding(wechat_user_id)
         if binding is None:
-            return "请先 /login 绑定账号"
+            return "请先发送 `/login` 绑定账号"
         # 核实该模型现在仍可用（列表不分页，成员判断是可靠的）
         available = await self._model_map(binding["jwt_token"], skip_hidden=True)
         if available is None:
-            return "暂时读不到模型列表（Open WebUI 不可达或登录已失效），请稍后重试"
+            return "无法获取模型列表，请稍后重试。"
         if model_id not in available:
-            return "该模型已不可用（可能已下架或在网页端被隐藏），请重新 /model list"
+            return "该模型已不可用，请重新 `/model list`。"
 
         # 只切模型、不打断会话：与网页端一致（换模型后继续同一会话，新回复成为新分支）
         self.state.set_focus(wechat_user_id, model_id=model_id)
+
+        model_name = available[model_id]
         focus = self.state.get_focus(wechat_user_id)
         where = "继续当前会话" if focus and focus["chat_id"] else "新建会话"
+        sections: list[str] = [f"## 使用模型\n{model_name}"]
+
         caps = await self._caps_for(binding["jwt_token"], model_id)
-        cap_line = f"\n能力：{caps.summary()}" if caps else ""
-        return f"已选用模型：{available[model_id]}{cap_line}\n下一条消息将{where}。"
+        if caps:
+            sections.extend(caps.format_sections())
+        else:
+            sections.append("## 模型能力\n未能获取")
+        sections.append(f"> 下一条消息将{where}")
+        return "\n\n".join(sections)
 
     # ---------- 会话 ----------
 
@@ -452,7 +475,7 @@ class CommandHandler:
     def _with_temp_notice(self, wechat_user_id: str, text: str) -> str:
         """临时聊天模式下操作持久会话：放行，但让用户知道自己在哪。"""
         if self.state.in_temporary(wechat_user_id):
-            return f"{TEMP_NOTICE}\n{text}"
+            return f"{TEMP_NOTICE}\n\n{text}"
         return text
 
     def _chat_new(self, wechat_user_id: str) -> str:
@@ -461,13 +484,16 @@ class CommandHandler:
         if self.state.in_temporary(wechat_user_id):
             # 临时会话不是本地记录的常规会话：切换前先经 /yes 确认退出
             self.state.set_pending(wechat_user_id, "temp_exit_new", "{}")
-            return "当前处于临时聊天。\n回复 /yes 退出临时聊天（临时记录将清空）并新建常规会话；/no 取消。"
+            return (
+                "**当前处于临时聊天！**\n"
+                "> `/yes` 退出并新建常规会话\n> `/no` 取消。"
+            )
         focus = self.state.get_focus(wechat_user_id)
         model_id = focus["model_id"] if focus else None
         self.state.set_focus(
             wechat_user_id, chat_id=None, leaf_id=None, is_first_message=1, chat_title=None, model_id=model_id
         )
-        return "已准备好新会话，下一条消息将创建它。"
+        return "**已进入新会话。**"
 
     async def _chat_temp(self, wechat_user_id: str) -> str:
         """进入/重开临时聊天：内容只存适配器本地，不写 OWUI（对齐网页端临时聊天语义）。"""
@@ -479,30 +505,33 @@ class CommandHandler:
         self.state.temporary_reset(wechat_user_id)
         self.state.set_focus(wechat_user_id, temporary=1)
 
-        model_line = "模型：未选择（首条消息自动选用）"
+        model_section = "## 使用模型\n未选择"
         if binding and model_id:
             labels = await self._model_map(binding["jwt_token"], skip_hidden=True)
             name = (labels or {}).get(model_id)
-            model_line = "模型：沿用当前选择" if labels is None else f"模型：{name or '未知'}"
+            model_section = (
+                "## 使用模型\n沿用当前选择" if labels is None else f"## 使用模型\n{name or '未知'}"
+            )
         elif not binding:
-            model_line = "模型：未绑定账号（请先 /login）"
+            model_section = "## 使用模型\n未绑定账号，请先 `/login`"
 
         if already:
-            return f"已清空临时记录，临时聊天重新开始。\n{model_line}"
+            return f"**已清空临时聊天记录并重新开始。**\n\n{model_section}"
         return (
-            "已进入临时聊天：对话只保存在适配器本地，不会写入 Open WebUI。\n"
-            f"{model_line}\n"
-            "再次 /chat temp 可清空重开；/chat attach <序号> 或 /chat new 可退出。"
+            "**已进入临时聊天。**\n"
+            "请注意，接下来的对话不会保存到历史记录。\n\n"
+            f"{model_section}\n\n"
+            "> `/chat temp` 重置对话内容\n> `/chat new` 退出临时聊天"
         )
 
     async def _chat_list(self, wechat_user_id: str, args: list[str]) -> str:
         binding = self.state.get_binding(wechat_user_id)
         if binding is None:
-            return "请先 /login 绑定账号"
+            return "请先 `/login` 绑定账号。"
         n = 5
         if args:
             if not args[0].isdigit():
-                return "用法：/chat list [条数]"
+                return "用法：`/chat list [条数]`。"
             n = max(1, min(20, int(args[0])))
         try:
             chats = await self.owui.list_chats(binding["jwt_token"], page=1)
@@ -510,34 +539,38 @@ class CommandHandler:
             return f"获取会话列表失败：{exc}"
         chats = [c for c in chats if not c.get("archived")][:n]
         if not chats:
-            return "还没有任何会话"
+            return "会话列表为空。"
 
         focus = self.state.get_focus(wechat_user_id)
         current = focus["chat_id"] if focus else None
         items = [(str(c["id"]), str(c.get("title") or "（无标题）")) for c in chats]
         self.state.save_snapshot(wechat_user_id, "chats", items)
 
-        lines = [f"最近 {len(items)} 条会话（用 /chat attach <序号> 切换）："]
+        lines = ["## 最近会话"]
         for i, chat in enumerate(chats, start=1):
             title = str(chat.get("title") or "（无标题）")
             marks = []
-            if str(chat.get("id")) == current:
-                marks.append("当前")
+            is_cur = str(chat.get("id")) == current
             if chat.get("active"):
                 marks.append("生成中")
-            tail = f" [{'/'.join(marks)}]" if marks else ""
-            lines.append(f"{i}. {title}{tail}")
-            lines.append(f"   {_fmt_ago(chat.get('updated_at'))}")
+            tail = f" {code_span('/'.join(marks))}" if marks else ""
+            display_title = f"**{title}**" if is_cur else title
+            ago = _fmt_ago(chat.get("updated_at"))
+            lines.append(f"{i}. {display_title}{tail} · {ago}")
+        lines.append("\n> `/chat attach <序号>` 切换")
         return "\n".join(lines)
 
     async def _chat_attach(self, wechat_user_id: str, args: list[str]) -> str:
         if not args or not args[0].isdigit():
-            return "用法：/chat attach <序号>（序号来自 /chat list）"
+            return "用法：`/chat attach <序号>`。\n> `/chat list` 获取会话列表"
         if self.state.in_temporary(wechat_user_id):
             self.state.set_pending(
                 wechat_user_id, "temp_exit_chat_attach", json.dumps({"args": args})
             )
-            return "当前处于临时聊天。\n回复 /yes 退出临时聊天（临时记录将清空）并切换到该会话；/no 取消。"
+            return (
+                "**当前处于临时聊天！**\n"
+                "> `/yes` 退出并切换到该会话\n> `/no` 取消。"
+            )
         return await self._do_attach(wechat_user_id, args)
 
     async def _do_attach(self, wechat_user_id: str, args: list[str]) -> str:
@@ -547,7 +580,7 @@ class CommandHandler:
         chat_id, title = got
         binding = self.state.get_binding(wechat_user_id)
         if binding is None:
-            return "请先 /login 绑定账号"
+            return "请先 `/login` 绑定账号。"
         try:
             detail = await self.owui.get_chat(binding["jwt_token"], chat_id)
         except OwuiError as exc:
@@ -570,19 +603,8 @@ class CommandHandler:
             fields["model_id"] = model_id
         self.state.set_focus(wechat_user_id, **fields)
 
-        lines = [f"已切换到会话：{fields['chat_title']}", model_line]
-        flags: list[str] = []
-        count = _message_count(chat_doc)
-        if count:
-            flags.append(f"{count} 条消息")
-        else:
-            flags.append("空会话")
-        flags.append(_fmt_ago(detail.get("updated_at")))
-        lines.append(" · ".join(flags))
-        if detail.get("archived"):
-            lines.append("状态：已归档（网页端可取消归档）")
-        lines.append("（后续消息会接在该会话末尾）")
-        return "\n".join(lines)
+        lines = [f"## 已切换到会话\n{fields['chat_title']}", model_line]
+        return "\n\n".join(lines)
 
     async def _chat_model_line(
         self, jwt_token: str, chat_doc: dict[str, Any], local_model_id: str
@@ -590,7 +612,7 @@ class CommandHandler:
         """返回 (回显文案, 应写入 focus 的 model_id)；返回 None 表示沿用本地选择。"""
         labels = await self._model_map(jwt_token, skip_hidden=True)
         if labels is None:
-            return "模型：暂时无法确认（读不到模型列表）", None
+            return "## 使用模型\n获取模型列表失败", None
         raw = chat_doc.get("models")
         wanted = [str(m) for m in raw if m] if isinstance(raw, list) else []
 
@@ -598,15 +620,15 @@ class CommandHandler:
             hits = [(mid, labels[mid]) for mid in wanted if mid in labels]
             if hits:
                 names = " / ".join(name for _, name in hits)
-                return f"模型：{names}（会话历史选择）", hits[0][0]
+                return f"## 使用模型\n{names}", hits[0][0]
             keep = labels.get(local_model_id) or ""
             note = f"，沿用 {keep}" if keep else ""
-            return f"模型：会话原用模型已不可用{note}", None
+            return f"## 使用模型\n会话原用模型已不可用{note}", None
 
         if local_model_id:
             label = labels.get(local_model_id) or "未知"
-            return f"模型：{label}（当前选择）", None
-        return "模型：未选择（下条消息自动选用）", None
+            return f"## 使用模型\n{label}", None
+        return "## 使用模型\n未选择", None
 
     async def _chat_delete(self, wechat_user_id: str, args: list[str]) -> str:
         chat_id, title, is_current, err = await self._resolve_chat_ref(wechat_user_id, args)
@@ -619,22 +641,23 @@ class CommandHandler:
             json.dumps({"chat_id": chat_id, "title": title, "is_current": is_current}),
         )
         return (
-            f"将永久删除会话「{title}」。此操作不可恢复——想保留可改用 /chat archive。"
-            f"\n回复 /yes 确认，/no 取消。"
+            f"**将永久删除会话「{title}」！**\n"
+            f"此操作不可恢复！\n"
+            f"> `/yes` 确认\n> `/no` 取消"
         )
 
     async def _do_delete(self, wechat_user_id: str, chat_id: str, title: str, is_current: bool) -> str:
         binding = self.state.get_binding(wechat_user_id)
         if binding is None:
-            return "请先 /login 绑定账号"
+            return "请先 `/login` 绑定账号。"
         try:
             await self.owui.delete_chat(binding["jwt_token"], chat_id)
         except OwuiError as exc:
             return f"删除失败：{exc}"
         if is_current:
             self._chat_new(wechat_user_id)
-            return "已删除当前会话，下一条消息将新建会话。"
-        return f"已删除会话「{title}」" if title else "已删除会话"
+            return f"**已删除会话「{title}」。**\n下一条消息将新建会话。"
+        return f"**已删除会话**「{title}」。" if title else "**已删除会话。**"
 
     async def _chat_archive(self, wechat_user_id: str, args: list[str]) -> str:
         chat_id, title, is_current, err = await self._resolve_chat_ref(wechat_user_id, args)
@@ -643,23 +666,23 @@ class CommandHandler:
         assert chat_id is not None
         binding = self.state.get_binding(wechat_user_id)
         if binding is None:
-            return "请先 /login 绑定账号"
+            return "请先 `/login` 绑定账号。"
         try:
             await self.owui.archive_chat(binding["jwt_token"], chat_id)
         except OwuiError as exc:
             return f"归档失败：{exc}"
         if is_current:
             self._chat_new(wechat_user_id)
-            return f"已归档「{title}」，下一条消息将新建会话。"
-        return f"已归档「{title}」（可在网页端归档列表中找回）"
+            return f"**已归档「{title}」。**\n下一条消息将新建会话。"
+        return f"**已归档「{title}」。**" if title else "**已归档会话。**"
 
     async def _chat_rename(self, wechat_user_id: str, args: list[str]) -> str:
         """支持 /chat rename <标题> 与 /chat rename <序号> <标题>。"""
         binding = self.state.get_binding(wechat_user_id)
         if binding is None:
-            return "请先 /login 绑定账号"
+            return "请先 `/login` 绑定账号。"
         if not args:
-            return "用法：/chat rename <标题> 或 /chat rename <序号> <标题>"
+            return "用法：`/chat rename <标题>` 或 `/chat rename <序号> <标题>`。"
 
         # 首 token 是数字且后面还有内容才当序号用（标题本身可以以数字开头）
         if args[0].isdigit() and len(args) > 1:
@@ -669,7 +692,7 @@ class CommandHandler:
             ref_args = []
             title_text = " ".join(args)
         if not title_text.strip():
-            return "新标题不能为空"
+            return "新标题不能为空！"
 
         chat_id, _live, is_current, err = await self._resolve_chat_ref(wechat_user_id, ref_args)
         if err:
@@ -681,7 +704,7 @@ class CommandHandler:
             return f"重命名失败：{exc}"
         if is_current:
             self.state.set_focus(wechat_user_id, chat_title=title_text)
-        return f"会话已重命名为「{title_text}」"
+        return f"**会话已重命名**为「{title_text}」。"
 
     async def _chat_lookup_failure(self, exc: OwuiError, jwt_token: str) -> str:
         """把 OWUI 的原始错误转成人话：不外泄英文 detail，也不误报成"序号过期"。
@@ -693,14 +716,14 @@ class CommandHandler:
         """
         code = exc.status_code
         if code == 404:
-            return "该会话已不存在（可能已在网页端删除），请重新 /chat list"
+            return "会话不存在，请重新 `/chat list`。"
         if code in (401, 403):
             if await self._session_alive(jwt_token):
-                return "该会话已不存在或无权访问（可能已在网页端删除），请重新 /chat list"
-            return "登录已失效，请发 /login-refresh 重新绑定"
+                return "该会话不存在或无权访问，请重新 `/chat list`。"
+            return "登录已失效，请重新 `/login-refresh`。"
         if code is None:
-            return "连不上 Open WebUI，请稍后重试"
-        return f"读取会话失败（Open WebUI 返回 {code}），请稍后重试"
+            return "连接失败，请稍后重试。"
+        return f"读取会话失败（{code}），请稍后重试。"
 
     async def _session_alive(self, jwt_token: str) -> bool:
         try:
@@ -734,7 +757,7 @@ class CommandHandler:
 
         binding = self.state.get_binding(wechat_user_id)
         if binding is None:
-            return None, "", False, "请先 /login 绑定账号"
+            return None, "", False, "请先 `/login` 绑定账号。"
         try:
             detail = await self.owui.get_chat(binding["jwt_token"], chat_id)
         except OwuiError as exc:
@@ -753,19 +776,19 @@ class CommandHandler:
             return resolved
         size = self.state.snapshot_size(wechat_user_id, "chats")
         if size == 0:
-            return "还没列出过会话，请先 /chat list"
+            return "请先 `/chat list` 刷新列表。"
         if idx > size:
-            return f"序号超出范围（上一次列表只有 {size} 条，可用 /chat list <条数> 看更多）"
-        return "序号无效，请重新 /chat list"
+            return f"会话列表发生变动，请重新 `/chat list`。"
+        return "序号无效，请重新 `/chat list`。"
 
 
 def _fmt_remaining(expires_at: int | None) -> str:
     """把令牌寿命说成人话：不暴露时间戳，也不出现"有效（未知（可能为长期有效））"这种套娃。"""
     if not expires_at:
-        return "长期有效（未设置过期时间）"
+        return "长期有效"
     remain = expires_at - time.time()
     if remain <= 0:
-        return "已过期，请发 /login-refresh 重新绑定"
+        return "已过期，`/login-refresh` 重新绑定。"
     if remain >= 2 * 86400:
         return f"有效，还剩约 {remain / 86400:.0f} 天"
     if remain >= 3600:

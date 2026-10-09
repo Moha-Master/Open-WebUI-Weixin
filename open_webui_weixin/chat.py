@@ -10,6 +10,7 @@ from typing import Any
 
 from . import capabilities
 from .config import AppConfig
+from .md import code_span
 from .owui import OwuiClient, OwuiError
 from .owui_socket import OwuiSocket
 from .render import TurnRenderer
@@ -113,7 +114,7 @@ class ChatRunner:
                 return result
             model_id, model_name = resolved
             self.state.set_focus(wechat_user_id, model_id=model_id)
-            result.notice = f"（未选择模型，已自动选用 {model_name}）"
+            result.notice = f"> 未选择模型，已自动选用 {code_span(model_name)}"
             await self._send_text(wechat_user_id, result.notice)
             log.info("自动选用模型 %s -> %s", model_id, wechat_user_id[:12])
 

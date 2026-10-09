@@ -21,6 +21,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .md import code_span
+
 log = logging.getLogger(__name__)
 
 # 进度类事件的中文措辞（status.action -> 文案）
@@ -199,7 +201,7 @@ class TurnRenderer:
         self.in_reasoning = True
         self.narration = ""
         if self.reasoning_detailed:
-            self.narration_prefix = "💭 思考："
+            self.narration_prefix = "💭 **思考**："
         else:
             # 只给一个提示，不刷屏：每个思考块一条
             out.notes.append("💭 正在思考…")
@@ -302,17 +304,18 @@ class TurnRenderer:
         if call.call_noted:
             return
         call.call_noted = True
-        line = f"🔧 调用了 {call.name}"
+        line = f"🔧 调用了 {code_span(call.name)}"
         args = _truncate(call.arguments)
         if args:
-            line += f"\n参数：{args}"
+            # 入参包进代码段：JSON 里的星号/下划线不该被当成 Markdown
+            line += f"\n参数：{code_span(args)}"
         out.notes.append(line)
 
     def _emit_result_note(self, call: _ToolCall, out: RenderedEvent) -> None:
         if call.result_noted or call.result is None:
             return
         call.result_noted = True
-        out.notes.append(f"↩ {call.name} 返回：{_truncate(call.result)}")
+        out.notes.append(f"↩ {code_span(call.name)} 返回：{code_span(_truncate(call.result))}")
 
     def _flush_summary(self, out: RenderedEvent) -> None:
         """汇总模式：把上一次正文之后的所有工具调用合成一条说明。"""
@@ -335,7 +338,7 @@ class TurnRenderer:
         self.summary_extras = []
         if not names:
             return
-        parts = [f"{n}×{counts[n]}" if counts.get(n, 0) > 1 else n for n in names]
+        parts = [f"{code_span(n)}×{counts[n]}" if counts.get(n, 0) > 1 else code_span(n) for n in names]
         out.notes.append(f"🔧 使用了 {len(names)} 个工具：" + "、".join(parts))
 
     def _fold_output(self, output: list, out: RenderedEvent) -> None:
@@ -498,12 +501,12 @@ class TurnRenderer:
     def citation_tail(self) -> str:
         if not self.sources:
             return ""
-        lines = ["参考："]
+        lines = ["## 参考来源"]
         for i, (name, url) in enumerate(list(self.sources.items())[:5], start=1):
-            label = name if name and name != url else url
-            lines.append(f"{i}. {label}")
             if name and name != url:
-                lines.append(f"   {url}")
+                lines.append(f"{i}. {name}\n   {url}")
+            else:
+                lines.append(f"{i}. {url}")
         return "\n".join(lines)
 
 

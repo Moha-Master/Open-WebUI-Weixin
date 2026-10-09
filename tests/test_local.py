@@ -1,6 +1,6 @@
 """不依赖微信/OWUI 真实服务的本地验证。
 
-运行: .venv/bin/python tests/test_local.py
+运行: venv/bin/python tests/test_local.py
 """
 
 from __future__ import annotations
@@ -452,12 +452,12 @@ async def main() -> None:
     check("失败不落绑定", st.get_binding(WX) is None)
 
     out = await handler.handle(WX, "/login me@b.com goodpass")
-    check("绑定成功", "已绑定" in out, out)
+    check("绑定成功", "绑定成功" in out, out)
     b = st.get_binding(WX)
     check("绑定写入 JWT", b is not None and b["jwt_token"] == "jwt-2")
     check("绑定写入密码以便刷新", b["owui_password"] == "goodpass")
     check("绑定写入过期时间", bool(b["jwt_expires_at"]))
-    check("登录回执含自动选用模型", "已自动选用模型：GPT Test" in out, out)
+    check("登录回执含自动选用模型", "GPT Test" in out and "已自动选用" in out, out)
     check("焦点已写入该模型", st.get_focus(WX)["model_id"] == "gpt-test")
 
     out = await handler.handle(WX, "随便说点什么")
@@ -527,14 +527,14 @@ async def main() -> None:
 
     print("\n[8c] 命令：/model list 只列网页端可见的模型，且不显示 id")
     out = await handler.handle(WX, "/model list")
-    check("只算非隐藏的 3 个", "共 3 个" in out, out.splitlines()[0])
+    check("只算非隐藏的 3 个", "## 可用模型" in out, out.splitlines()[0])
     check("hidden 模型不出现", "ghost-test" not in out and "Ghost Test" not in out, out)
     check("也不提示有隐藏模型", "隐藏" not in out, out)
     check("不显示任何模型 id", "gpt-test" not in out and "gpt-test-lite" not in out, out)
     check("每模型只占一行", len(out.splitlines()) == 4, out.splitlines())
     check(
-        "当前模型带 ←当前 标记",
-        any("Claude Test" in ln and "←当前" in ln for ln in out.splitlines()),
+        "当前模型带加粗标记",
+        any("**Claude Test**" in ln for ln in out.splitlines()),
         out,
     )
 
@@ -625,7 +625,7 @@ async def main() -> None:
     check("被隐藏的模型同样视为不可用", "已不可用" in out, out)
     del owui.models[1]["info"]["meta"]
     out = await handler.handle(WX, "/model use 2")
-    check("恢复可用后选择成功", "已选用模型：GPT Test Lite" in out, out)
+    check("恢复可用后选择成功", "GPT Test Lite" in out and "## 使用模型" in out, out)
 
     good_jwt = st.get_binding(WX)["jwt_token"]
     st.upsert_binding(
@@ -646,24 +646,24 @@ async def main() -> None:
     print("\n[8f] 命令：/status 现取现解析能力（不必先发过消息）")
     st.set_focus(WX, model_id="gpt-test")
     out = await handler.handle(WX, "/status")
-    check("有能力行", "能力：" in out, out)
+    check("有能力行", "能力" in out, out)
     check("能力用中文名", "联网搜索" in out and "记忆" in out, out)
     check("列出所选工具的名字", "图片取回" in out and "GitHub" in out, out)
     check("未被该模型选中的工具不出现", "没被该模型选中的工具" not in out, out)
     check("失效工具（清单里已无）不出现", "tool-gone" not in out, out)
-    check("列出终端名字", "终端：Sandbox" in out, out)
+    check("列出终端名字", "## 连接的终端\n`Sandbox`" in out, out)
     check("summary 不外露 id", "term-1" not in out and "tool-a" not in out, out)
     check("memory 回落管理员总闸", "记忆" in out, out)
-    check("令牌文案不再套娃括号", "长期有效" in out and "（未知" not in out, out)
+    check("不再回显登录令牌（用户要求移除）", "登录令牌" not in out, out)
 
-    # 挂着终端 → 复刻网页端互斥，代码解释器必须关
-    check("挂终端时代码解释器被互斥关掉", "代码解释器" not in out, out)
+    # 挂着终端 → 复刻网页端互斥，代码运行必须关
+    check("挂终端时代码运行被互斥关掉", "代码运行" not in out, out)
     owui.terminals = []  # 终端下线，互斥解除，引擎闸门开始起作用
     out = await handler.handle(WX, "/status")
-    check("摘掉终端且引擎可服务端执行时才开启", "代码解释器" in out, out)
+    check("摘掉终端且引擎可服务端执行时才开启", "代码运行" in out, out)
     owui.engine = "pyodide"  # 需浏览器执行，适配器答不了 execute:python 回调
     out = await handler.handle(WX, "/status")
-    check("pyodide 引擎下不开代码解释器", "代码解释器" not in out, out)
+    check("pyodide 引擎下不开代码运行", "代码运行" not in out, out)
     owui.engine = "jupyter"
     owui.terminals = [{"id": "term-1", "name": "Sandbox"}]
 
@@ -683,7 +683,7 @@ async def main() -> None:
     print("\n[8g] 命令：/model use 同时回显该模型能力")
     await handler.handle(WX, "/model list")
     out = await handler.handle(WX, "/model use 1")
-    check("选择回执含能力行", "能力：" in out and "联网搜索" in out, out)
+    check("选择回执含能力行", "## 模型能力" in out and "联网搜索" in out, out)
 
     print("\n[9] 命令：/whoami 用 JWT 实测")
     out = await handler.handle(WX, "/whoami")
@@ -702,7 +702,7 @@ async def main() -> None:
     out = await handler.handle(WX, "/whoami")
     check("失效 JWT 提示刷新", "已失效" in out and "/login-refresh" in out, out)
     out = await handler.handle(WX, "/status")
-    check("/status 标记过期", "已过期" in out, out)
+    check("/status 依然不显令牌但流程正常", "## OWUI用户" in out, out)
 
     print("\n[10] 文本切分与入站解析")
     st2 = cfg.reply

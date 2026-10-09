@@ -6,7 +6,7 @@
 JWT 失效时 connect 依然"成功"，只是不进 user:{id} 房间 ——
 表现为生成能跑但适配器一个事件都收不到，会一直等到超时。
 
-运行: .venv/bin/python tests/probe_socket.py [工作目录]（默认 ~/.config/owux）
+运行: venv/bin/python tests/probe_socket.py [工作目录]（默认 ~/.config/owux）
 """
 
 from __future__ import annotations

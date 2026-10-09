@@ -2,7 +2,7 @@
 
 用 mock transport 拦截 iLink 请求，不联网。
 
-运行: .venv/bin/python tests/test_typing.py
+运行: venv/bin/python tests/test_typing.py
 """
 
 from __future__ import annotations

@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from .config import CapabilityConfig
+from .md import code_span
 from .owui import OwuiClient, OwuiError
 
 log = logging.getLogger(__name__)
@@ -45,7 +46,7 @@ ADMIN_GATE = {
 _FEATURE_LABELS = {
     "web_search": "联网搜索",
     "image_generation": "图像生成",
-    "code_interpreter": "代码解释器",
+    "code_interpreter": "代码运行",
     "memory": "记忆",
 }
 
@@ -93,6 +94,23 @@ class RequestCaps:
         if self.filter_ids:
             parts.append(f"筛选器 {len(self.filter_ids)} 个")
         return " · ".join(parts)
+
+    def format_sections(self) -> list[str]:
+        """分节 Markdown：只列出实际生效的项，全部用行内代码显示名字。"""
+        sections: list[str] = []
+        on = [name for name, value in self.features.items() if value]
+        if on:
+            tags = " ".join(code_span(_FEATURE_LABELS.get(n, n)) for n in on)
+            sections.append(f"## 模型能力\n{tags}")
+
+        if self.tools:
+            tags = " ".join(code_span(t.label) for t in self.tools)
+            sections.append(f"## 启用的工具\n{tags}")
+
+        if self.terminal:
+            sections.append(f"## 连接的终端\n{code_span(self.terminal.label)}")
+
+        return sections
 
     def body_fields(self) -> dict[str, Any]:
         """转成请求体字段；空值一律省略（与网页端 ``length > 0 ? … : undefined`` 一致）。

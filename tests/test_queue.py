@@ -7,7 +7,7 @@
 - 焦点状态在真实回环里推进
 - socket 建不起来时给用户可读错误而不是静默卡死
 
-运行: .venv/bin/python tests/test_queue.py
+运行: venv/bin/python tests/test_queue.py
 """
 
 from __future__ import annotations

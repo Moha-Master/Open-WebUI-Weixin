@@ -3,7 +3,7 @@
 验证不需要真人扫码就能覆盖的路径：
 长轮询 -> 游标持久化 -> 入站解析 -> context_token 捕获 -> 命令分发 -> 出站载荷正确性
 
-运行: .venv/bin/python tests/test_integration.py
+运行: venv/bin/python tests/test_integration.py
 """
 
 from __future__ import annotations
@@ -225,7 +225,7 @@ async def main() -> None:
     await drive(adapter, 1)
     b = state.get_binding(WX_USER)
     check("绑定已写入", b is not None and b["owui_email"] == "me@b.c")
-    check("回复确认绑定", "已绑定" in sent_json(), sent_json()[:200])
+    check("回复确认绑定", "绑定成功" in sent_json(), sent_json()[:200])
 
     print("\n[5] /login-refresh 换新 JWT")
     old_jwt = b["jwt_token"]

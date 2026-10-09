@@ -4,7 +4,7 @@
 1. get_bot_qrcode  是否返回 qrcode + qrcode_img_content
 2. get_qrcode_status 是否返回可识别的状态（未扫码应为 wait）
 
-运行: .venv/bin/python tests/probe_weixin.py [工作目录]（默认 ~/.config/owux）
+运行: venv/bin/python tests/probe_weixin.py [工作目录]（默认 ~/.config/owux）
 """
 
 from __future__ import annotations

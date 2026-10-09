@@ -8,13 +8,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 SESSION=oc-owux
-BIN=.venv/bin/owux
+BIN=venv/bin/owux
 # 一切数据都落在工作目录（默认 ~/.config/open-webui-weixin/），代码目录保持只读。
 # 想换地方就加 --dir，例：CMD=("$BIN" --dir /data/owux)
 CMD=("$BIN")
 
 if [[ ! -x "$BIN" ]]; then
-    echo "缺少 .venv/bin/owux，请先执行: python3 -m venv .venv && .venv/bin/pip install -e ." >&2
+    echo "缺少 venv/bin/owux，请先执行: python3 -m venv venv && venv/bin/pip install -e ." >&2
     exit 1
 fi
 

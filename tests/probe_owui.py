@@ -3,7 +3,7 @@
 用错误凭据请求 /signin，验证：端点路径、请求体形状、错误 detail 解析、
 以及未鉴权请求的行为。不会创建或改动任何账号。
 
-运行: .venv/bin/python tests/probe_owui.py [工作目录]（默认 ~/.config/owux）
+运行: venv/bin/python tests/probe_owui.py [工作目录]（默认 ~/.config/owux）
 """
 
 from __future__ import annotations

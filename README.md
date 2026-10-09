@@ -57,7 +57,7 @@
 
 ## 环境要求
 
-- 宿主机 Python 3.11+（本项目用 `.venv`，不污染系统环境；当前 3.14.4 实测可用）
+- 宿主机 Python 3.11+（本项目用 `venv`，不污染系统环境；当前 3.14.4 实测可用）
 - 可出站访问 `ilinkai.weixin.qq.com`
 - 一个运行中的 Open WebUI，且 `ENABLE_PASSWORD_AUTH=true`
 - 手机微信支持 ClawBot 授权入口
@@ -68,8 +68,8 @@
 
 ```bash
 cd /webservices/open-webui-weixin
-python3 -m venv .venv
-.venv/bin/pip install -e .        # 装出可执行入口 .venv/bin/owux
+python3 -m venv venv
+venv/bin/pip install -e .        # 装出可执行入口 venv/bin/owux
 
 ./tests/run.sh              # 后台 tmux 启动（推荐）
 ./tests/run.sh -f           # 前台
@@ -142,6 +142,21 @@ owux user del <序号>      # 移除账号（需 stdin 输入 y 确认）
 
 核实必须用**直查**而不是"看它是否还在最新列表里"：列表是分页 top-N，会话可能只是翻到了下一页，那样会把活着的会话误报成已删除。
 
+### 回复排版：微信原生 Markdown
+
+iLink 的文本条目（`item_list[].type=1`）**由微信客户端直接渲染 Markdown**，与模型正文同一条通道，不需要任何开关或额外字段（实测来自模型回复的渲染表现）。可用的子集参照 openclaw-weixin 的 `StreamingMarkdownFilter`：
+
+| 用 | 不用 |
+|---|---|
+| `#`～`####` 标题、表格、有序/无序列表、`**加粗**`、行内代码、代码块、引用块 `> `、分隔线 | `*斜体*` 包中文（CJK 内容不渲染，会露出裸星号）、`#####`/`######`、图片 `![alt](url)` |
+
+落到文案上的约定（`md.py` 里留了同一份说明）：
+
+- 命令回复（`/help`、`/status`、`/model list` 等）写成 Markdown，不再用空格硬凑对齐；
+- 命令名与各种**名字**（能力、工具、终端、模型）用行内代码，与说明文字区分，同时天然不含 id；
+- 分节用 `##`，补充说明用引用块 `> `，强调只用加粗；
+- 命令回复走 `send_text` 的按长度兜底切分（不是模型正文那套 Markdown 感知切分）：`/help` 全文约 700 字，在默认 `max_length: 1024` 下不会切碎表格；把上限调小就会看到表格被切断。
+
 ### 模型选择策略
 
 OWUI 后端**不做**默认模型兜底：`chat_completion` 里 `model_id = form_data.get('model', None)`，`None` 不在 `MODELS` 中就 `raise Exception('Model not found')`（`main.py:1118/1128`）。网页端那套"新对话用默认模型、已有对话用上次的模型"**全是前端行为**。因此适配器自己实现同款策略：
@@ -153,7 +168,7 @@ OWUI 后端**不做**默认模型兜底：`chat_completion` 里 `model_id = form
 | 会话原模型已下架 | 明说"已不可用"并沿用当前选择，不静默换模型 |
 | `/model use` | 只切模型、不打断会话（与网页端一致，新回复成为新分支）；临时聊天模式下同样生效 |
 | `/chat temp` | 进入/重开临时聊天：回合请求体带 `chat_id=temporary:<sid>` 与全量历史，成功后对话只写本地表、不动持久焦点断点；临时回合不请求标题/标签生成 |
-| `/status` | 显示模型名与该模型的能力（能力名、所用工具名、终端名），一律不显示 id |
+| `/status` | 分节显示 OWUI 用户、当前会话、使用模型，以及实际生效的能力/工具/终端**名字**；不显示 id、邮箱与登录令牌 |
 
 ### 能力策略（工具 / 联网搜索 / 终端）
 
@@ -204,16 +219,16 @@ display:
 ## 测试
 
 ```bash
-.venv/bin/python tests/test_caps.py         # 模型 meta → 请求能力字段的翻译（纯函数）
-.venv/bin/python tests/test_local.py        # 协议头/状态存储（含多账号隔离）/命令/切分
-.venv/bin/python tests/test_integration.py  # mock 微信服务端驱动完整主循环（含 -14 与热加载）
-.venv/bin/python tests/test_chat.py         # 事件渲染 + 回合生命周期 + 焦点链推进
-.venv/bin/python tests/test_queue.py        # 排队合并 / /stop / socket 失败降级
-.venv/bin/python tests/test_typing.py       # 票据、keepalive、owner 引用计数
+venv/bin/python tests/test_caps.py         # 模型 meta → 请求能力字段的翻译（纯函数）
+venv/bin/python tests/test_local.py        # 协议头/状态存储（含多账号隔离）/命令/切分
+venv/bin/python tests/test_integration.py  # mock 微信服务端驱动完整主循环（含 -14 与热加载）
+venv/bin/python tests/test_chat.py         # 事件渲染 + 回合生命周期 + 焦点链推进
+venv/bin/python tests/test_queue.py        # 排队合并 / /stop / socket 失败降级
+venv/bin/python tests/test_typing.py       # 票据、keepalive、owner 引用计数
 
-.venv/bin/python tests/probe_owui.py        # 真实 OWUI（非破坏性）
-.venv/bin/python tests/probe_weixin.py      # 真实 iLink（只申请二维码，不扫码）
-.venv/bin/python tests/probe_socket.py      # 真实 socket 通道（连接+user-join，不生成）
+venv/bin/python tests/probe_owui.py        # 真实 OWUI（非破坏性）
+venv/bin/python tests/probe_weixin.py      # 真实 iLink（只申请二维码，不扫码）
+venv/bin/python tests/probe_socket.py      # 真实 socket 通道（连接+user-join，不生成）
 
 ruff check --config pyproject.toml .
 ```
@@ -250,7 +265,8 @@ open_webui_weixin/            包本体（运行时只读，数据一律写在�
   runtime.py                  每用户运行时：socket 生命周期 + 串行队列
   chat.py                     单个生成回合的执行与焦点推进
   render.py                   OWUI 事件 → 微信消息序列（结构切分：标题前/分隔线后，保护代码块/公式/表格/列表）
-  commands.py                 斜杠命令
+  commands.py                 斜杠命令（回复为 Markdown 文案）
+  md.py                       微信 Markdown 子集与文案小工具（行内代码/分节）
   adapter.py                  多账号主循环（每账号一条长轮询 + watcher 热接管）、分发、出站路由
 tests/                        见上「测试」
 ```

@@ -18,8 +18,8 @@
 
 - **命名分工**：pip 包名 `open-webui-weixin`、包目录 `open_webui_weixin/`、默认工作目录 `~/.config/open-webui-weixin/` 都用全称（在 `pip list`、`~/.config` 里一眼可辨），**命令行入口保持短名 `owux`**。
 - **包布局**：顶层即包目录 `open_webui_weixin/`（不用 `src/` 布局），`pyproject.toml` 用 setuptools 声明 `packages.find`。
-- **依赖单一来源**：全部依赖写在 `pyproject.toml` 的 `[project].dependencies`，**不再维护 `requirements.txt`**。安装：`.venv/bin/pip install -e .`。
-- **入口可执行文件**：`[project.scripts] owux = "open_webui_weixin.main:main"`，装完得到 `.venv/bin/owux`；`python -m open_webui_weixin` 与直接执行 `owux` 等价。
+- **依赖单一来源**：全部依赖写在 `pyproject.toml` 的 `[project].dependencies`，**不再维护 `requirements.txt`**。安装：`venv/bin/pip install -e .`。
+- **入口可执行文件**：`[project.scripts] owux = "open_webui_weixin.main:main"`，装完得到 `venv/bin/owux`；`python -m open_webui_weixin` 与直接执行 `owux` 等价。
 - **工作目录机制**：程序启动即 `chdir` 到 `--dir`（默认 `~/.config/open-webui-weixin/`），配置与 `data/`（SQLite、日志）全部落在其中。
   - **MUST**：代码目录（包括包目录）在运行时**只读**，不生成、不修改任何文件；换机器/换盘只需搬走工作目录。
   - **MUST NOT**：新增运行时读写路径时依赖进程原始 cwd 或代码目录位置，一律从 `AppConfig.base_dir` 派生。
@@ -35,7 +35,10 @@
 ### 1. 交互去内部化
 - **MUST NOT**：在微信回复中露出任何内部标识，包括模型 ID、会话 ID、微信 ID。
 - **MUST NOT**：显示或提示被隐藏的模型（`info.meta.hidden`）。
+- **MUST NOT**：`/status` 显示邮箱或登录令牌（用户名缺失才回落邮箱）；令牌寿命只在 `/login-refresh` 回执与到期提醒里说。
 - **MUST**：删除确认文案中仅显示标题，不显示 ID。
+- **MUST**：面向微信的文案一律写 Markdown——分节用 `##`（H1–H4 才渲染，别用 `#####`）、列表用有序号、名字（能力/工具/终端/模型）用行内代码、命令提示用反引号、补充说明用引用块 `> `。**不要用 `*斜体*` 包中文**：微信对 CJK 内容的强调标记不渲染（参照实现直接把标记剥掉），会露出裸星号。
+- **微信 Markdown 无需开关**：iLink 的文本条目（`type=1`）就是按 Markdown 排版的，模型正文走的就是同一条 `send_text` 通道，命令回复照写即可。
 
 ### 2. 能力对齐策略
 - **现取现用**：不设 TTL 缓存。每回合生成前并发执行 5 个 REST 请求（模型、工具、终端、配置、用户设置）实时推导能力。
@@ -84,12 +87,14 @@
 - `open_webui_weixin/capabilities.py`：**翻译层核心**。
   - `Ref(id, name)`：封装引用，`.id` 用于请求体，`.label` 用于 `/status` 显示。
   - `resolve()`：核心纯函数，实现多层闸门逻辑。
+  - `RequestCaps.format_sections()`：把生效能力渲染成 `/status`、`/model use` 共用的 Markdown 分节（能力/工具/终端各自成节，空节不输出）；`summary()` 保留给日志。特性显示名见 `_FEATURE_LABELS`（`code_interpreter` 对外叫「代码运行」）。
 - `open_webui_weixin/adapter.py`：**多账号主循环**。`AccountHandle`（token + 自有 `IlinkClient` + `TypingKeeper` + 轮询 task）；`Adapter._accounts`/`_user_account` 维护账号池与 wxid→账号映射；`_poll_loop`（每账号一条）、`_watch_accounts`/`_sync_accounts_once`（热接管）、`_account_expired`（per-account 的 -14 处置）都在这一层。`self.client` 只服务扫码流程（`/relogin`），不参与收发。
 - `open_webui_weixin/chat.py`：回合执行逻辑，负责组装请求体并处理流式响应。
 - `open_webui_weixin/owui.py`：REST 客户端封装。
 - `open_webui_weixin/owui_socket.py`：Socket.io 处理器。
   - 必须响应 `request:terminal:state` 返回 `{connected: false}` 以干净剔除浏览器侧终端逻辑。
-- `open_webui_weixin/commands.py`：微信指令层（`/chat`, `/model`, `/status` 等）。人域逻辑，与账号无关。
+- `open_webui_weixin/commands.py`：微信指令层（`/chat`, `/model`, `/status` 等）。人域逻辑，与账号无关。回复是 Markdown 文本：`##` 分节 + 行内代码 + 引用块补充，序号列表用 `1. 2. 3.`（当前项加粗）。
+- `open_webui_weixin/md.py`：微信侧 Markdown 文案小工具（`code_span` 行内代码），并记录「微信渲染哪些 Markdown、哪些不渲染」的子集，供各层统一措辞。
 - `open_webui_weixin/state.py`：数据库操作层。账号管理方法：`load_accounts`/`save_login`（per-account 副作用）/`clear_account`/`get_sync_buf`/`set_sync_buf`/`save_context_token`/`get_context_token`/`account_for_user`；`_migrate` 负责旧库升级（`context_token` 重建复合键、全局游标归户到唯一账号）。
 - `open_webui_weixin/main.py`：CLI 入口——服务模式（零账号提示退出）、`--check`（逐账号探测登录态）、`user add|list|del` 子命令（`LoginFlow` 复用扫码状态机）。
 - `open_webui_weixin/login.py`：扫码登录状态机 + ASCII 二维码（`user add` 与 `/relogin` 共用）。confirmed 后 `state.save_login` 落库；`local_token_list` 只是申请二维码时的报备字段，**不是账号配额**。
@@ -110,8 +115,8 @@
   - `tests/test_temp.py`：临时聊天（本地存档、模式切换、请求体形状、命令确认流）。
   - `tests/test_queue.py`：adapter 层队列/回合接线（手工装配 `AccountHandle`，不经 `run()`）。
   - `tests/test_integration.py`：端到端连通性探测 + 多账号行为：per-account 的 -14 清理、watcher 热接管（新增/重授权/删除）用 `_sync_accounts_once` + spy 断言。
-- **自检命令**：`.venv/bin/owux --check`（按 `--dir` 解析工作目录，逐账号探测登录态，不发消息不改绑定）。
-- **服务运行**：通过 `./tests/run.sh` 启动 tmux 会话 `oc-owux`（脚本会 `cd` 到仓库根再找 `.venv/bin/owux`）。日志位于工作目录 `data/adapter.log`。
+- **自检命令**：`venv/bin/owux --check`（按 `--dir` 解析工作目录，逐账号探测登录态，不发消息不改绑定）。
+- **服务运行**：通过 `./tests/run.sh` 启动 tmux 会话 `oc-owux`（脚本会 `cd` 到仓库根再找 `venv/bin/owux`）。日志位于工作目录 `data/adapter.log`。
 
 ---
 
@@ -120,7 +125,7 @@
 1. **401 语义模糊**：OWUI 在"会话找不到"和"登录过期"时都返回 401。必须通过 `GET /api/v1/auths/whoami` 辅助判断。
 2. **`tools` 键陷阱**：请求体中一旦出现 `tools` 键（哪怕是 `[]`），后端会跳过所有 `tool_ids` 解析。
 3. **模型参数缺失**：`/api/models` 接口会剥除 `info.params`，导致适配器无法得知模型是否支持 legacy function calling。
-4. **JWT 过期**：本项目仅支持 JWT 认证。若 `JWT_EXPIRES_IN=-1`，`/status` 应显示"长期有效"。
+4. **JWT 过期**：本项目仅支持 JWT 认证。若 `JWT_EXPIRES_IN=-1`（无过期时间），`/login-refresh` 应显示"长期有效"；`/status` 不再显示令牌（见交互去内部化）。
 5. **工具调用事件形状**：原生 function calling 下调用侧事件齐（`response.output_item.added/done` 带 `function_call`、`response.function_call_arguments.delta/.done` 带入参），但**工具返回 `function_call_output` 只 append 到 output 数组、不单独成事件**（`middleware.py:6156`），只能在终态 `chat:completion` 的 `output` 快照里取。另外 `continuing = bool(metadata['assistant_message_id'])`（客户端显式带该字段才为真，`main.py:1273`），为真时后端**改发 `chat:completion` 全量 output 快照**而不再发 `response:completion` 增量（`middleware.py:5012/5064`）——只认增量的客户端会整轮失聪。
 
 ---
@@ -189,8 +194,8 @@
 
 适配器接收来自微信（iLink 接口）的单点文本消息，通过首字符 `/` 判断并解析：
 
-- `/help`、`/?`、`/h`：显示适配器的纯文本帮助及命令说明。
-- `/status`：显示当前绑定的 Open WebUI 登录身份（管理员、用户名等）、JWT 令牌有效天数说明，以及焦点会话、焦点模型名及当前消息回合会启用的**具名能力摘要（工具名、终端名）**。
+- `/help`、`/?`、`/h`：显示帮助（`#` 标题 + 分类 `##` 表格，命令列用行内代码）。
+- `/status`：分节 Markdown（`## OWUI用户` / `## 当前会话` / `## 使用模型` / 按需追加的 `## 模型能力`、`## 启用的工具`、`## 连接的终端`）。**不显示邮箱、不显示登录令牌**（令牌状态只在 `/login-refresh` 与到期提醒里出现）；能力/工具/终端只在实际生效时显示，名字用行内代码。
 - `/login <邮箱> <密码>`：发起绑定，进行多项初始化自检。
 - `/login-refresh`：用于主动或自动重新登录以换取新 JWT 令牌（由于 OWUI 无 refresh_token，直接用内部密码库自动执行）。
 - `/logout`：清除本地数据库中的用户绑定映射，切断状态。

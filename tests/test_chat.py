@@ -9,7 +9,7 @@
   探测失败时降级为空、有快照则复用；绝不出现 tools 键
 - 关键回归：新建会话时不带 chat_id 且 parent_id 必须为 null
 
-运行: .venv/bin/python tests/test_chat.py
+运行: venv/bin/python tests/test_chat.py
 """
 
 from __future__ import annotations
@@ -152,7 +152,7 @@ def test_reasoning_display_modes() -> None:
     full.handle(ev("response:completion", {"type": "response.reasoning_text.delta", "delta": "推理内容"}))
     fdone = full.handle(ev("chat:completion", {"done": True, "output": []}))
     ftext = "".join(fdone.notes)
-    check("全文模式推思考原文", "推理内容" in ftext and ftext.startswith("💭 思考："), ftext)
+    check("全文模式推思考原文", "推理内容" in ftext and ftext.startswith("💭 **思考**："), ftext)
     check("思考不污染正文缓冲", full.buffer == "" and full.full_text == "",
           (repr(full.buffer), full.full_text))
 
@@ -180,15 +180,15 @@ def test_tool_status_display_modes() -> None:
         "item": {"type": "function_call", "call_id": "c1", "name": "web_open", "arguments": "{}"},
     }))
     joined = "\n".join(d1.notes + dargs.notes + d2.notes)
-    check("入参齐了才出声", "调用了 web_open" in joined and "参数：" in joined, joined)
-    check("同一调用不重复发", joined.count("调用了 web_open") == 1, joined)
+    check("入参齐了才出声", "调用了 `web_open`" in joined and "参数：" in joined, joined)
+    check("同一调用不重复发", joined.count("调用了 `web_open`") == 1, joined)
     d3 = detail.handle(ev("chat:completion", {"done": True, "output": [
         {"type": "function_call", "call_id": "c1", "name": "web_open", "arguments": "{}"},
         {"type": "function_call_output", "call_id": "c1",
          "output": [{"type": "input_text", "text": "页面正文" * 60}]},
     ]}))
     rnote = "".join(d3.notes)
-    check("返回从终态快照回填", "web_open 返回：" in rnote, rnote)
+    check("返回从终态快照回填", "`web_open` 返回：" in rnote, rnote)
     check("长返回被截断并标注原长", "…（共 " in rnote, rnote)
     check("工具不进正文缓冲", detail.buffer == "", repr(detail.buffer))
 
@@ -203,13 +203,13 @@ def test_tool_status_display_modes() -> None:
     }))
     b2 = brief.handle(text_delta("汇总正文"))
     check("链式调用中途不出声", b1.notes == [], b1.notes)
-    check("正文开始前汇总全部", b2.notes == ["🔧 使用了 1 个工具：read_file×2"], b2.notes)
+    check("正文开始前汇总全部", b2.notes == ["🔧 使用了 1 个工具：`read_file`×2"], b2.notes)
     brief.handle(ev("response:completion", {
         "type": "response.output_item.added",
         "item": {"type": "function_call", "call_id": "c3", "name": "calc"},
     }))
     b3 = brief.handle(text_delta("第二段"))
-    check("汇总只算上一段之后的调用", b3.notes == ["🔧 使用了 1 个工具：calc"], b3.notes)
+    check("汇总只算上一段之后的调用", b3.notes == ["🔧 使用了 1 个工具：`calc`"], b3.notes)
 
     st = TurnRenderer(max_length=100)
     s1 = st.handle(ev("status", {"action": "web_search", "description": "搜索: 天气", "done": False}))
@@ -246,12 +246,12 @@ def test_sources_tail() -> None:
     r.handle(ev("citation", {"links": [{"name": "标题B", "url": "https://b.example"}]}))
     r.handle(ev("source", {"title": "标题A", "url": "https://a.example"}))  # 重复
     tail = r.citation_tail()
-    check("尾注以参考开头", tail.startswith("参考："), tail)
+    check("尾注以参考来源标题开头", tail.startswith("## 参考来源"), tail)
     check("含 A 与 B", "标题A" in tail and "标题B" in tail, tail)
     check("去重后只两条", tail.count("http") == 2, tail)
 
     out = r.handle(ev("chat:completion", {"done": True, "output": []}))
-    check("done 时尾注随文本发出", any("参考：" in c for c in out.text_chunks), out.text_chunks)
+    check("done 时尾注随文本发出", any("参考来源" in c for c in out.text_chunks), out.text_chunks)
 
 
 def test_error_and_cancel() -> None:

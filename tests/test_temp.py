@@ -4,7 +4,7 @@
 （backend/open_webui/utils/chat_id.py），历史由调用方全量随请求体携带。
 微信侧没有浏览器替用户保管内存里的历史，所以对话内容存进 temporary_chat 表。
 
-运行: .venv/bin/python tests/test_temp.py
+运行: venv/bin/python tests/test_temp.py
 """
 
 from __future__ import annotations

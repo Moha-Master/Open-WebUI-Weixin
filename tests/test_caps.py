@@ -3,7 +3,7 @@
 用例里的 meta 与工具/终端名字取自真实实例（GET /api/models、/api/v1/tools/、
 /api/v1/terminals/），不是编的。
 
-运行: .venv/bin/python tests/test_caps.py
+运行: venv/bin/python tests/test_caps.py
 """
 
 from __future__ import annotations
