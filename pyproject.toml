@@ -20,6 +20,12 @@ dependencies = [
     "aiohttp>=3.11",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Moha-Master/Open-WebUI-Weixin"
+Repository = "https://github.com/Moha-Master/Open-WebUI-Weixin.git"
+GitHub = "https://github.com/Moha-Master/Open-WebUI-Weixin"
+Issues = "https://github.com/Moha-Master/Open-WebUI-Weixin/issues"
+
 # 入口保持简短好敲；包名与工作目录用全称，便于在 pip / ~/.config 里一眼认出
 [project.scripts]
 owux = "open_webui_weixin.main:main"
